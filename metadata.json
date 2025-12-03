@@ -1,0 +1,5 @@
+{
+  "name": "Orbit Architect",
+  "description": "Design multi-stage rockets with modular parts and simulate their launch with realistic physics. Includes AI-powered mission analysis.",
+  "requestFramePermissions": []
+}
