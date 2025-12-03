@@ -97,6 +97,7 @@ export interface SimulationState {
   eccentricity: number;
   apoapsis: number;
   periapsis: number;
+  specificEnergy: number; // Specific Orbital Energy (J/kg) for stability debugging
   
   parts: RocketPart[];
   debris: Debris[];
