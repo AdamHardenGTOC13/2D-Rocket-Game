@@ -11,6 +11,7 @@ interface RocketRendererProps {
   ghostPosition?: { x: number, y: number };
   onPartClick?: (partId: string) => void;
   onPartContextMenu?: (partId: string) => void;
+  onPartHover?: (partId: string | null, clientX: number, clientY: number) => void;
   isDeleteMode?: boolean;
 }
 
@@ -22,6 +23,7 @@ export const RocketRenderer: React.FC<RocketRendererProps> = ({
   ghostPosition,
   onPartClick,
   onPartContextMenu,
+  onPartHover,
   isDeleteMode = false
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -150,12 +152,19 @@ export const RocketRenderer: React.FC<RocketRendererProps> = ({
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-      // Only do hit testing if we have interactivity handlers
-      if (!onPartClick && !onPartContextMenu) return;
+      // Always do hit testing if onPartHover is present, OR if interact handlers are present
+      if (!onPartClick && !onPartContextMenu && !onPartHover) return;
 
       const { x, y } = getMouseWorldPos(e);
       const hitId = hitTest(layout, x, y);
-      setHoveredPartId(hitId);
+      
+      if (hitId !== hoveredPartId) {
+          setHoveredPartId(hitId);
+      }
+      
+      if (onPartHover) {
+          onPartHover(hitId, e.clientX, e.clientY);
+      }
   };
 
   const handleClick = (e: React.MouseEvent) => {
@@ -170,6 +179,11 @@ export const RocketRenderer: React.FC<RocketRendererProps> = ({
           onPartContextMenu(hoveredPartId);
       }
   };
+  
+  const handleMouseLeave = () => {
+      setHoveredPartId(null);
+      if (onPartHover) onPartHover(null, 0, 0);
+  };
 
   return (
     <div ref={containerRef} className="w-full h-full relative overflow-hidden">
@@ -179,7 +193,7 @@ export const RocketRenderer: React.FC<RocketRendererProps> = ({
         onMouseMove={handleMouseMove}
         onClick={handleClick}
         onContextMenu={handleContextMenu}
-        onMouseLeave={() => setHoveredPartId(null)}
+        onMouseLeave={handleMouseLeave}
       />
     </div>
   );

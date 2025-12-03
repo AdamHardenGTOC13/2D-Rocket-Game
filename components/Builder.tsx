@@ -2,10 +2,10 @@ import React, { useState, useRef, useMemo } from 'react';
 import { RocketPart, RocketPartDef, PartType } from '../types';
 import { AVAILABLE_PARTS } from '../constants';
 import { RocketRenderer } from './RocketRenderer';
-import { Plus, Trash2, Rocket, RotateCcw, BrainCircuit, Columns, Info, MousePointer2, Eraser, Calculator, AlertTriangle, Download, Upload } from 'lucide-react';
+import { Plus, Trash2, Rocket, RotateCcw, BrainCircuit, Columns, Info, MousePointer2, Eraser, Calculator, AlertTriangle, Download, Upload, Fuel, Gauge, Wind, Layers } from 'lucide-react';
 import { analyzeMission } from '../services/geminiService';
 import { calculateRocketLayout, getAvailableNodes, SCALE, getRocketBounds } from '../utils/rocketUtils';
-import { calculateEngineeringStats } from '../utils/engineeringUtils';
+import { calculateEngineeringStats, assignStages } from '../utils/engineeringUtils';
 
 interface BuilderProps {
   parts: RocketPart[];
@@ -21,6 +21,12 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
   const [showEngineering, setShowEngineering] = useState(true);
   const [zoom, setZoom] = useState(1);
 
+  // Hover Tooltip State for Sidebar Parts
+  const [hoveredInfo, setHoveredInfo] = useState<{ part: RocketPartDef, top: number } | null>(null);
+
+  // Hover Tooltip State for Placed Parts
+  const [hoveredPlacedInfo, setHoveredPlacedInfo] = useState<{ id: string, x: number, y: number } | null>(null);
+
   // Dragging State
   const [draggedDef, setDraggedDef] = useState<RocketPartDef | null>(null);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
@@ -35,6 +41,7 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
   
   // Engineering Stats
   const stageStats = useMemo(() => calculateEngineeringStats(parts), [parts]);
+  const partStageMap = useMemo(() => assignStages(parts), [parts]);
   const totalDeltaV = stageStats.reduce((sum, s) => sum + s.deltaV, 0);
 
   const handleWheel = (e: React.WheelEvent) => {
@@ -80,6 +87,14 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
     });
     
     setSnapNode(bestNode);
+  };
+
+  const handlePlacedPartHover = (id: string | null, clientX: number, clientY: number) => {
+      if (id) {
+          setHoveredPlacedInfo({ id, x: clientX, y: clientY });
+      } else {
+          setHoveredPlacedInfo(null);
+      }
   };
 
   const handlePartDrop = () => {
@@ -245,6 +260,134 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
   const totalMass = parts.reduce((sum, p) => sum + p.mass + (p.currentFuel || 0), 0);
   const totalCost = parts.reduce((sum, p) => sum + p.cost, 0);
 
+  const renderPartTooltip = () => {
+      if (!hoveredInfo) return null;
+      const { part, top } = hoveredInfo;
+      
+      return (
+          <div 
+            className="fixed z-50 w-72 bg-slate-800 border border-slate-600 rounded-xl shadow-2xl p-4 text-slate-100 pointer-events-none"
+            style={{ left: '21rem', top: Math.min(top, window.innerHeight - 300) }} // Clamp so it doesn't go off screen
+          >
+              <div className="flex justify-between items-start mb-2">
+                  <h3 className="font-bold text-lg text-white">{part.name}</h3>
+                  <span className="text-[10px] uppercase bg-slate-700 px-2 py-0.5 rounded text-slate-400 font-bold">{part.type}</span>
+              </div>
+              <p className="text-sm text-slate-400 mb-4 italic leading-relaxed">{part.description}</p>
+              
+              <div className="space-y-2">
+                  <div className="flex justify-between text-sm border-b border-slate-700 pb-1">
+                      <span className="text-slate-500">Mass</span>
+                      <span className="font-mono">{part.mass} <span className="text-slate-600 text-xs">kg</span></span>
+                  </div>
+                  <div className="flex justify-between text-sm border-b border-slate-700 pb-1">
+                      <span className="text-slate-500">Cost</span>
+                      <span className="font-mono text-green-400">${part.cost}</span>
+                  </div>
+                  <div className="flex justify-between text-sm border-b border-slate-700 pb-1">
+                      <span className="text-slate-500 flex items-center"><Wind size={12} className="mr-1"/> Drag Coeff</span>
+                      <span className="font-mono">{part.dragCoeff}</span>
+                  </div>
+                  
+                  {part.fuelCapacity !== undefined && (
+                      <div className="flex justify-between text-sm border-b border-slate-700 pb-1">
+                          <span className="text-slate-500 flex items-center"><Fuel size={12} className="mr-1"/> Fuel Cap</span>
+                          <span className="font-mono text-cyan-400">{part.fuelCapacity} <span className="text-slate-600 text-xs">kg</span></span>
+                      </div>
+                  )}
+                  
+                  {part.thrust !== undefined && (
+                      <div className="flex justify-between text-sm border-b border-slate-700 pb-1">
+                          <span className="text-slate-500 flex items-center"><Gauge size={12} className="mr-1"/> Thrust</span>
+                          <span className="font-mono text-orange-400">{(part.thrust/1000).toFixed(1)} <span className="text-slate-600 text-xs">kN</span></span>
+                      </div>
+                  )}
+                  
+                  {part.burnRate !== undefined && (
+                       <div className="flex justify-between text-sm border-b border-slate-700 pb-1">
+                          <span className="text-slate-500">Burn Rate</span>
+                          <span className="font-mono">{part.burnRate} <span className="text-slate-600 text-xs">kg/s</span></span>
+                      </div>
+                  )}
+              </div>
+          </div>
+      );
+  };
+  
+  const renderPlacedPartTooltip = () => {
+    if (!hoveredPlacedInfo) return null;
+    const { id, x, y } = hoveredPlacedInfo;
+    
+    // Don't overlap with drag/sidebar if dragging
+    if (draggedDef) return null;
+
+    const part = parts.find(p => p.instanceId === id);
+    if (!part) return null;
+
+    const stageIndex = partStageMap.get(id);
+    const stage = stageStats.find(s => s.stageIndex === stageIndex);
+    
+    // Convert logic stages (0=top, N=bottom) to user-facing stages (1=top, N+1=bottom) or vice versa.
+    // Usually standard rocketry counts down (Stage 3 -> 2 -> 1).
+    // Our stageStats has 0 as top. Let's just display "Stage X".
+    
+    // Offset tooltip from cursor
+    const style: React.CSSProperties = {
+        left: x + 15,
+        top: y + 15,
+    };
+    
+    // Ensure it stays on screen
+    if (x > window.innerWidth - 300) style.left = x - 260;
+    if (y > window.innerHeight - 200) style.top = y - 180;
+
+    return (
+        <div 
+            className="fixed z-[60] w-60 bg-slate-900/90 backdrop-blur border border-cyan-500/50 rounded-lg shadow-2xl p-3 text-slate-100 pointer-events-none"
+            style={style}
+        >
+            <div className="text-sm font-bold text-white mb-1 border-b border-white/10 pb-1">{part.name}</div>
+            
+            {stageIndex !== undefined && (
+                 <div className="flex items-center text-xs font-bold text-yellow-500 mb-2">
+                     <Layers size={12} className="mr-1"/> Stage {stageStats.length - stageIndex}
+                 </div>
+            )}
+            
+            {stage && (
+                <div className="space-y-1">
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div>
+                            <div className="text-slate-500">Stage Δv</div>
+                            <div className="font-mono text-cyan-400">{stage.deltaV.toFixed(0)} m/s</div>
+                        </div>
+                        <div>
+                            <div className="text-slate-500">Stage TWR</div>
+                            <div className={`font-mono ${stage.twr < 1 ? 'text-red-400' : 'text-green-400'}`}>
+                                {stage.twr.toFixed(2)}
+                            </div>
+                        </div>
+                    </div>
+                    {part.type === PartType.ENGINE && (
+                         <div className="mt-2 pt-1 border-t border-white/10 text-xs">
+                             <div className="text-slate-500">Thrust</div>
+                             <div className="font-mono text-orange-400">{((part.thrust || 0)/1000).toFixed(1)} kN</div>
+                         </div>
+                    )}
+                     {part.currentFuel !== undefined && (
+                         <div className="mt-1 text-xs">
+                             <div className="text-slate-500">Fuel</div>
+                             <div className="font-mono text-blue-400">{part.currentFuel.toFixed(0)} kg</div>
+                         </div>
+                    )}
+                </div>
+            )}
+            
+            {!stage && <div className="text-xs text-slate-500">No stage data</div>}
+        </div>
+    );
+  };
+
   return (
     <div 
         className="flex h-screen bg-slate-900 text-slate-100 overflow-hidden" 
@@ -289,11 +432,14 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
                    {typeParts.map(part => (
                      <div
                        key={part.id}
+                       onMouseEnter={(e) => setHoveredInfo({ part, top: e.currentTarget.getBoundingClientRect().top })}
+                       onMouseLeave={() => setHoveredInfo(null)}
                        onMouseDown={() => {
                            setDraggedDef(part);
                            setDeleteMode(false); // Disable delete mode on drag
+                           setHoveredInfo(null); // Hide tooltip when dragging starts
                        }}
-                       className="cursor-grab active:cursor-grabbing flex items-center p-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-left group border border-transparent hover:border-slate-500"
+                       className="cursor-grab active:cursor-grabbing flex items-center p-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-left group border border-transparent hover:border-slate-500 relative"
                      >
                         <div className="w-10 h-10 bg-slate-800 rounded flex items-center justify-center mr-3 text-slate-400">
                            <MousePointer2 size={16} />
@@ -332,6 +478,7 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
                 ghostPosition={snapNode ? { x: snapNode.x, y: snapNode.y } : mousePos}
                 onPartClick={deleteMode ? removePart : undefined}
                 onPartContextMenu={removePart}
+                onPartHover={handlePlacedPartHover}
                 isDeleteMode={deleteMode}
              />
           )}
@@ -455,6 +602,10 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
         </div>
       </div>
       
+      {/* Tooltip Overlay */}
+      {renderPartTooltip()}
+      {renderPlacedPartTooltip()}
+
       {/* Analysis Overlay */}
       {analysis && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">

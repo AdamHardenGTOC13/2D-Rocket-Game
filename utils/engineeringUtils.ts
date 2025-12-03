@@ -17,32 +17,41 @@ export interface StageStats {
 
 const G0 = 9.81;
 
-export const calculateEngineeringStats = (parts: RocketPart[]): StageStats[] => {
-    if (parts.length === 0) return [];
-
-    // 1. Assign Stages via BFS/Tree Traversal
-    // Structural Staging: Root is Stage 0. Decouplers increment stage index for their children.
+export const assignStages = (parts: RocketPart[]): Map<string, number> => {
     const partStageMap = new Map<string, number>();
+    if (parts.length === 0) return partStageMap;
+
     const root = parts.find(p => !p.parentId);
-    if (!root) return [];
+    if (!root) return partStageMap;
     
-    let maxStage = 0;
+    // BFS to assign stages
+    // Root is 0. Decouplers increment stage count for their children.
     const queue: { part: RocketPart, stage: number }[] = [{ part: root, stage: 0 }];
     
     while(queue.length > 0) {
         const { part, stage } = queue.shift()!;
         partStageMap.set(part.instanceId, stage);
-        maxStage = Math.max(maxStage, stage);
         
         const children = parts.filter(p => p.parentId === part.instanceId);
         children.forEach(child => {
-            // If the PARENT is a decoupler, the child starts a new structural stage
             let nextStage = stage;
             if (part.type === PartType.DECOUPLER) {
                 nextStage = stage + 1;
             }
             queue.push({ part: child, stage: nextStage });
         });
+    }
+    return partStageMap;
+};
+
+export const calculateEngineeringStats = (parts: RocketPart[]): StageStats[] => {
+    if (parts.length === 0) return [];
+
+    const partStageMap = assignStages(parts);
+    
+    let maxStage = 0;
+    for (const s of partStageMap.values()) {
+        maxStage = Math.max(maxStage, s);
     }
 
     const stats: StageStats[] = [];
