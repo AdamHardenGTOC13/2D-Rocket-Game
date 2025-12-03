@@ -153,7 +153,10 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
       if (e.key === 'ArrowLeft') keysRef.current.left = true;
       if (e.key === 'ArrowRight') keysRef.current.right = true;
       if (e.key === 'Shift') setThrottle(t => Math.min(1, t + 0.1));
-      if (e.key === 'Control') setThrottle(t => Math.max(0, t - 0.1));
+      if (e.key === 'Control') setThrottle(t => {
+          const next = t - 0.1;
+          return next < 0.01 ? 0 : next; // Snap to 0
+      });
       if (e.key === 'z') setThrottle(1);
       if (e.key === 'x') setThrottle(0);
       if (e.key === 't') setSasMode(m => m === SASMode.STABILITY ? SASMode.MANUAL : SASMode.STABILITY);
@@ -278,8 +281,8 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
      const eVec = {
         x: ((vSq - orbMu/r)*relPos.x - rv*relVel.x) / orbMu,
         y: ((vSq - orbMu/r)*relPos.y - rv*relVel.y) / orbMu
-     };
-     const e = vMag(eVec);
+    };
+    const e = vMag(eVec);
      const energy = vSq/2 - orbMu/r;
      const a = -orbMu / (2*energy);
 
@@ -336,66 +339,128 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
      ctx.restore();
 
 
-     // 5. Rocket
+     // 5. Rocket Parts
      // Draw Icon if zoomed out
      if (zoom < 0.1) {
          ctx.fillStyle = '#facc15';
          const iconSize = 10 / zoom;
          ctx.beginPath(); ctx.arc(state.position.x, state.position.y, iconSize, 0, Math.PI*2); ctx.fill();
      } else {
-         // Draw Parts
-         ctx.translate(state.position.x, state.position.y);
-         ctx.rotate(state.rotation);
-         const layout = calculateRocketLayout(state.parts);
-         layout.forEach(p => {
-             ctx.save();
-             // Convert pixels from layout to meters
-             ctx.translate(p.x/SCALE, p.y/SCALE); 
-             ctx.rotate(p.rotation);
-             if (p.radialOffset === -1) ctx.scale(-1, 1);
-             const style = getPartStyle(p.type);
-             ctx.fillStyle = style.fill;
-             ctx.strokeStyle = style.stroke;
-             ctx.lineWidth = 0.1;
-             
-             // Check deployment state for parachutes
-             const isDeployed = p.type === PartType.PARACHUTE ? p.isDeployed : false;
-             
-             drawPartShape(ctx, p.type, p.width, p.height, isDeployed || p.isThrusting); 
-             ctx.fill();
-             ctx.stroke();
+         const renderParts = (parts: RocketPart[], x: number, y: number, r: number) => {
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.rotate(r);
+            const layout = calculateRocketLayout(parts);
+            layout.forEach(p => {
+                ctx.save();
+                // Convert pixels from layout to meters
+                ctx.translate(p.x/SCALE, p.y/SCALE); 
+                ctx.rotate(p.rotation);
+                if (p.radialOffset === -1) ctx.scale(-1, 1);
+                const style = getPartStyle(p.type);
+                ctx.fillStyle = style.fill;
+                ctx.strokeStyle = style.stroke;
+                ctx.lineWidth = 0.1;
+                
+                // Check deployment state for parachutes
+                const isDeployed = p.type === PartType.PARACHUTE ? p.isDeployed : false;
+                
+                drawPartShape(ctx, p.type, p.width, p.height, isDeployed || p.isThrusting); 
+                ctx.fill();
+                ctx.stroke();
 
-             // Fuel Level Overlay
-             if (p.type === PartType.TANK && p.fuelCapacity && p.currentFuel !== undefined) {
-                 const fuelRatio = p.currentFuel / p.fuelCapacity;
-                 const fuelHeight = p.height * fuelRatio;
-                 
-                 ctx.save();
-                 // Create clip from the tank shape to handle rounded corners
-                 drawPartShape(ctx, p.type, p.width, p.height, false);
-                 ctx.clip();
-                 
-                 const hh = p.height / 2;
-                 const hw = p.width / 2;
-                 
-                 ctx.fillStyle = 'rgba(6, 182, 212, 0.4)'; // Cyan-ish transparency
-                 // Draw from bottom up
-                 ctx.fillRect(-hw, hh - fuelHeight, p.width, fuelHeight);
-                 ctx.restore();
-             }
+                // Fuel Level Overlay
+                if (p.type === PartType.TANK && p.fuelCapacity && p.currentFuel !== undefined) {
+                    const fuelRatio = p.currentFuel / p.fuelCapacity;
+                    const fuelHeight = p.height * fuelRatio;
+                    
+                    ctx.save();
+                    drawPartShape(ctx, p.type, p.width, p.height, false);
+                    ctx.clip();
+                    const hh = p.height / 2;
+                    const hw = p.width / 2;
+                    ctx.fillStyle = 'rgba(6, 182, 212, 0.4)'; 
+                    ctx.fillRect(-hw, hh - fuelHeight, p.width, fuelHeight);
+                    ctx.restore();
+                }
 
-             // Engine Flame
-             if (p.type === PartType.ENGINE && p.isThrusting) {
-                 ctx.fillStyle = '#f97316';
-                 ctx.beginPath();
-                 ctx.moveTo(-p.width/4, p.height/2);
-                 ctx.lineTo(p.width/4, p.height/2);
-                 ctx.lineTo(0, p.height/2 + 2 + Math.random()*2); 
-                 ctx.fill();
-             }
-             ctx.restore();
+                // Engine Flame
+                if (p.type === PartType.ENGINE && p.isThrusting) {
+                    ctx.fillStyle = '#f97316';
+                    ctx.beginPath();
+                    ctx.moveTo(-p.width/4, p.height/2);
+                    ctx.lineTo(p.width/4, p.height/2);
+                    ctx.lineTo(0, p.height/2 + 2 + Math.random()*2); 
+                    ctx.fill();
+                }
+                ctx.restore();
+            });
+            ctx.restore();
+         };
+         
+         // Active Vessel
+         renderParts(state.parts, state.position.x, state.position.y, state.rotation);
+         
+         // Debris
+         state.debris.forEach(deb => {
+             renderParts(deb.parts, deb.position.x, deb.position.y, deb.rotation);
          });
      }
+
+     // 6. Force Visualization
+     if (zoom > 0.1) {
+         ctx.translate(state.position.x, state.position.y);
+         const scaleForce = (vec: Vector2) => {
+             const m = vMag(vec);
+             if (m < 0.1) return {x:0, y:0};
+             // Logarithmic scale for visualisation: 50px for 10kN, 100px for 100kN, 150px for 1000kN...
+             // Or simpler: Scaled by acceleration (g-force). 1g = 50px line.
+             // F/mass = acc. 
+             // Let's use acceleration scaling: 20 pixels per m/s^2
+             // Total mass? We don't have it here easily in drawFrame without re-calc.
+             // Fallback: Fixed logarithmic scale for raw Force.
+             const logMag = Math.log10(m + 1); // 1N -> 0.3, 10N -> 1, 100kN -> 5
+             const pixelLen = logMag * 15; 
+             return vScale(vNorm(vec), pixelLen);
+         }
+
+         const drawVector = (vec: Vector2 | undefined, color: string) => {
+             if (!vec) return;
+             const v = scaleForce(vec);
+             if (vMag(v) < 1) return;
+             ctx.beginPath();
+             ctx.moveTo(0, 0);
+             ctx.lineTo(v.x, v.y);
+             ctx.strokeStyle = color;
+             ctx.lineWidth = 2 / zoom;
+             ctx.stroke();
+             // Arrowhead
+             const headLen = 5 / zoom;
+             const angle = Math.atan2(v.y, v.x);
+             ctx.beginPath();
+             ctx.moveTo(v.x, v.y);
+             ctx.lineTo(v.x - headLen * Math.cos(angle - Math.PI / 6), v.y - headLen * Math.sin(angle - Math.PI / 6));
+             ctx.lineTo(v.x - headLen * Math.cos(angle + Math.PI / 6), v.y - headLen * Math.sin(angle + Math.PI / 6));
+             ctx.fillStyle = color;
+             ctx.fill();
+         }
+         
+         if (state.forces) {
+             drawVector(state.forces.gravity, '#22c55e'); // Green Gravity
+             drawVector(state.forces.drag, '#ef4444');    // Red Drag
+             
+             // Strict check to only draw thrust if significant (matches logic in updatePhysics)
+             const tMag = vMag(state.forces.thrust);
+             if (tMag > 1) {
+                drawVector(state.forces.thrust, '#f97316');  // Orange Thrust
+             }
+             
+             // Total
+             const total = vAdd(vAdd(state.forces.gravity, state.forces.drag), state.forces.thrust);
+             drawVector(total, '#ffffff');
+         }
+     }
+
      ctx.restore();
   };
 
@@ -404,7 +469,7 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
     const currentState = stateRef.current;
     if (!currentState.active || currentState.finished) return;
 
-    let { position, velocity, rotation, angularVelocity, time, parts, events, maxAltitude } = currentState;
+    let { position, velocity, rotation, angularVelocity, time, parts, events, maxAltitude, debris } = currentState;
     const warp = timeWarpRef.current;
     
     // Run physics steps based on Time Warp
@@ -416,12 +481,15 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
     // Build Connectivity Map for Fuel Flow (BFS)
     const childrenMap = getChildrenMap(parts);
 
-    for(let s = 0; s < effectiveSteps; s++) {
-        time += dt;
+    const getMoonPos = (t: number) => {
+         const angle = (t / MOON_ORBITAL_PERIOD) * 2 * Math.PI;
+         return { x: Math.cos(angle) * MOON_ORBIT_RADIUS, y: Math.sin(angle) * MOON_ORBIT_RADIUS };
+    };
 
-        // 1. Celestial Positions
-        const moonAngle = (time / MOON_ORBITAL_PERIOD) * 2 * Math.PI;
-        const moonPos = { x: Math.cos(moonAngle) * MOON_ORBIT_RADIUS, y: Math.sin(moonAngle) * MOON_ORBIT_RADIUS };
+    let lastForces = { thrust: {x:0, y:0}, gravity: {x:0, y:0}, drag: {x:0, y:0} };
+
+    for(let s = 0; s < effectiveSteps; s++) {
+        const moonPosStart = getMoonPos(time);
 
         // 2. Mass Properties & Drag Area
         let mass = 0;
@@ -442,7 +510,8 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
         let totalThrust = 0;
         const currentThrottle = stateRef.current.throttle;
         
-        if (currentThrottle > 0) {
+        // Strict threshold to avoid floating point phantom thrust
+        if (currentThrottle > 0.001) {
             parts.forEach(p => {
                 if (p.type === PartType.ENGINE) {
                     const isBlocked = isEngineBlockedByStage(p, childrenMap);
@@ -496,11 +565,13 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
             parts.forEach(p => p.isThrusting = false);
         }
 
+        console.log(totalThrust);
+
         const thrustDir = { x: Math.sin(rotation), y: -Math.cos(rotation) }; 
         const thrustVec = vScale(thrustDir, totalThrust);
 
-        // Helper to Calculate Environmental Forces
-        const getForces = (pos: Vector2, vel: Vector2) => {
+        // Helper to Calculate Environmental Forces (Patched Conics)
+        const getForces = (pos: Vector2, vel: Vector2, mPos: Vector2, area: number = 10) => {
              // Gravity Planet
              const r2 = pos.x*pos.x + pos.y*pos.y;
              const r = Math.sqrt(r2);
@@ -508,8 +579,8 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
              const gVecP = { x: fGravityP * (pos.x/r), y: fGravityP * (pos.y/r) };
 
              // Gravity Moon
-             const dMx = pos.x - moonPos.x;
-             const dMy = pos.y - moonPos.y;
+             const dMx = pos.x - mPos.x;
+             const dMy = pos.y - mPos.y;
              const rm2 = dMx*dMx + dMy*dMy;
              const rm = Math.sqrt(rm2);
              const fGravityM = -MOON_GRAVITATIONAL_PARAM / rm2;
@@ -526,37 +597,42 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
              const speedSq = vDot(vel, vel);
              const speed = Math.sqrt(speedSq);
              if (density > 0 && speed > 0.1) {
-                  const dragMag = 0.5 * density * speedSq * dragArea * 0.2; 
+                  const dragMag = 0.5 * density * speedSq * area * 0.2; 
                   const velDir = vNorm(vel);
                   dragVec = vScale(velDir, -dragMag);
              }
 
-             return vAdd(vAdd(gVecP, gVecM), dragVec);
+             // PATCHED CONICS: Only apply gravity of the SOI we are in
+             let gravity = gVecP;
+             const distMoon = vMag(vSub(pos, mPos));
+             if (distMoon < MOON_SOI_RADIUS) {
+                 gravity = gVecM;
+             }
+
+             return {
+                 gravity,
+                 drag: dragVec
+             };
         };
 
-        // --- VELOCITY VERLET INTEGRATION ---
+        // --- STRICT VELOCITY VERLET INTEGRATION ---
         
-        // 1. Current Forces
-        const forces1 = getForces(position, velocity);
-        const totalForce1 = vAdd(forces1, thrustVec);
-        const accel1 = vScale(totalForce1, 1/mass);
+        // 1. Forces at Start (t)
+        const forces1 = getForces(position, velocity, moonPosStart, dragArea);
+        const totalF1 = vAdd(vAdd(forces1.gravity, forces1.drag), thrustVec);
+        const accel1 = vScale(totalF1, 1/mass);
 
         // 2. Half-Step Velocity
         const vHalf = vAdd(velocity, vScale(accel1, 0.5 * dt));
 
         // 3. Full-Step Position
-        position = vAdd(position, vScale(vHalf, dt));
+        const nextPos = vAdd(position, vScale(vHalf, dt));
 
-        // 4. New Forces (approximate drag with vHalf)
-        const forces2 = getForces(position, vHalf); 
-        const totalForce2 = vAdd(forces2, thrustVec);
-        const accel2 = vScale(totalForce2, 1/mass);
+        // 4. Update Time
+        time += dt;
+        const moonPosEnd = getMoonPos(time);
 
-        // 5. Full-Step Velocity
-        velocity = vAdd(vHalf, vScale(accel2, 0.5 * dt));
-
-
-        // 6. Rotation (Standard Euler is fine for rotation here)
+        // 5. Rotation Update (Standard Euler)
         let controlTorque = 0;
         if (keysRef.current.left) controlTorque -= 10000;
         if (keysRef.current.right) controlTorque += 10000;
@@ -588,6 +664,31 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
         angularVelocity += alpha * dt;
         rotation += angularVelocity * dt;
 
+        // Recalculate Thrust Vector for End Step (if rotation changed)
+        const thrustDirNext = { x: Math.sin(rotation), y: -Math.cos(rotation) }; 
+        const thrustVecNext = vScale(thrustDirNext, totalThrust);
+
+        // 6. Forces at End (t+dt) using vHalf approximation for drag
+        const forces2 = getForces(nextPos, vHalf, moonPosEnd, dragArea);
+        const totalF2 = vAdd(vAdd(forces2.gravity, forces2.drag), thrustVecNext);
+        const accel2 = vScale(totalF2, 1/mass);
+
+        // 7. Full-Step Velocity
+        velocity = vAdd(vHalf, vScale(accel2, 0.5 * dt));
+        position = nextPos;
+        
+        lastForces = { ...forces2, thrust: thrustVecNext };
+
+        // --- DEBRIS PHYSICS (Simplified Euler) ---
+        debris.forEach(d => {
+             // Basic Gravity
+             const fDebris = getForces(d.position, d.velocity, moonPosEnd, 5); 
+             const fTotal = vAdd(fDebris.gravity, fDebris.drag);
+             const a = vScale(fTotal, 1/500); // Approximate mass 500kg
+             d.velocity = vAdd(d.velocity, vScale(a, dt));
+             d.position = vAdd(d.position, vScale(d.velocity, dt));
+             d.rotation += d.angularVelocity * dt;
+        });
 
         // 8. Collisions
         // Planet Surface
@@ -620,12 +721,9 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
         }
         
         // Moon Surface
-        if (vMag({x: position.x - moonPos.x, y: position.y - moonPos.y}) <= MOON_RADIUS) {
-             // ... same crash logic ...
-             // Simplified for brevity in this patch context
-             const dMx = position.x - moonPos.x;
-             const dMy = position.y - moonPos.y;
-             const rm = Math.sqrt(dMx*dMx + dMy*dMy);
+        if (vMag({x: position.x - moonPosEnd.x, y: position.y - moonPosEnd.y}) <= MOON_RADIUS) {
+             const dMx = position.x - moonPosEnd.x;
+             const dMy = position.y - moonPosEnd.y;
              const radialVel = vDot(velocity, vNorm({x: dMx, y: dMy}));
              
              if (radialVel < -10) {
@@ -636,7 +734,7 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
                  events.push("THE EAGLE HAS LANDED!");
                  currentState.active = false;
                  currentState.finished = true;
-                 position = vAdd(moonPos, vScale(vNorm({x: dMx, y: dMy}), MOON_RADIUS));
+                 position = vAdd(moonPosEnd, vScale(vNorm({x: dMx, y: dMy}), MOON_RADIUS));
                  velocity = { x: 0, y: 0 }; 
              }
         }
@@ -709,7 +807,9 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
         semiMajorAxis: sma,
         eccentricity: ecc,
         apoapsis: apo,
-        periapsis: peri
+        periapsis: peri,
+        debris,
+        forces: lastForces
     };
     
     setSimState(stateRef.current);
@@ -782,11 +882,20 @@ export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) 
     const stageParts = currentParts.filter(p => stageMap.get(p.instanceId) === maxStage);
     const stagePartIds = new Set(stageParts.map(p => p.instanceId));
 
+    // Fix parentIds for debris root(s)
+    const debrisParts = stageParts.map(p => {
+        const pCopy = { ...p, isThrusting: false };
+        // If parent is not in this debris chunk, it's a root of the debris
+        if (p.parentId && !stagePartIds.has(p.parentId)) {
+            pCopy.parentId = undefined;
+        }
+        return pCopy;
+    });
+
     // Create debris from the separated parts
-    // In a full physics engine we'd calculate center of mass offset, etc.
     const debrisObj = {
         id: Math.random().toString(36),
-        parts: stageParts.map(p => ({...p, isThrusting: false})), // Turn off engines in debris
+        parts: debrisParts,
         position: { ...stateRef.current.position },
         velocity: { ...stateRef.current.velocity }, // Inherit velocity
         rotation: stateRef.current.rotation,

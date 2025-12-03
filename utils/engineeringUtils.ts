@@ -25,7 +25,7 @@ export const assignStages = (parts: RocketPart[]): Map<string, number> => {
     if (!root) return partStageMap;
     
     // BFS to assign stages
-    // Root is 0. Decouplers increment stage count for their children.
+    // Root is 0. 
     const queue: { part: RocketPart, stage: number }[] = [{ part: root, stage: 0 }];
     
     while(queue.length > 0) {
@@ -35,7 +35,8 @@ export const assignStages = (parts: RocketPart[]): Map<string, number> => {
         const children = parts.filter(p => p.parentId === part.instanceId);
         children.forEach(child => {
             let nextStage = stage;
-            if (part.type === PartType.DECOUPLER) {
+            // If the child is a decoupler, it belongs to the next stage (the one being dropped)
+            if (child.type === PartType.DECOUPLER) {
                 nextStage = stage + 1;
             }
             queue.push({ part: child, stage: nextStage });
@@ -125,3 +126,4 @@ export const calculateEngineeringStats = (parts: RocketPart[]): StageStats[] => 
     // Return ordered from Bottom (Launch) to Top
     return stats;
 };
+        
