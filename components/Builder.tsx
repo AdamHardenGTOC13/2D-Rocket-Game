@@ -6,6 +6,7 @@ import { Plus, Trash2, Rocket, RotateCcw, BrainCircuit, Columns, Info, MousePoin
 import { analyzeMission } from '../services/geminiService';
 import { calculateRocketLayout, getAvailableNodes, SCALE, getRocketBounds } from '../utils/rocketUtils';
 import { calculateEngineeringStats, assignStages } from '../utils/engineeringUtils';
+import { getChildrenMap, findFuelSources } from '../utils/fuelUtils';
 
 interface BuilderProps {
   parts: RocketPart[];
@@ -43,6 +44,18 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
   const stageStats = useMemo(() => calculateEngineeringStats(parts), [parts]);
   const partStageMap = useMemo(() => assignStages(parts), [parts]);
   const totalDeltaV = stageStats.reduce((sum, s) => sum + s.deltaV, 0);
+
+  // Fuel Flow Visualization
+  const fuelFlows = useMemo(() => {
+      if (!hoveredPlacedInfo) return [];
+      const part = parts.find(p => p.instanceId === hoveredPlacedInfo.id);
+      if (part && part.type === PartType.ENGINE) {
+          const childrenMap = getChildrenMap(parts);
+          const sources = findFuelSources(part, parts, childrenMap);
+          return [{ engineId: part.instanceId, tankIds: sources.map(s => s.part.instanceId) }];
+      }
+      return [];
+  }, [hoveredPlacedInfo, parts]);
 
   const handleWheel = (e: React.WheelEvent) => {
       setZoom(prev => {
@@ -327,10 +340,6 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
     const stageIndex = partStageMap.get(id);
     const stage = stageStats.find(s => s.stageIndex === stageIndex);
     
-    // Convert logic stages (0=top, N=bottom) to user-facing stages (1=top, N+1=bottom) or vice versa.
-    // Usually standard rocketry counts down (Stage 3 -> 2 -> 1).
-    // Our stageStats has 0 as top. Let's just display "Stage X".
-    
     // Offset tooltip from cursor
     const style: React.CSSProperties = {
         left: x + 15,
@@ -480,6 +489,7 @@ export const Builder: React.FC<BuilderProps> = ({ parts, onPartsChange, onLaunch
                 onPartContextMenu={removePart}
                 onPartHover={handlePlacedPartHover}
                 isDeleteMode={deleteMode}
+                fuelFlows={fuelFlows}
              />
           )}
           

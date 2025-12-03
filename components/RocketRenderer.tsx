@@ -13,6 +13,7 @@ interface RocketRendererProps {
   onPartContextMenu?: (partId: string) => void;
   onPartHover?: (partId: string | null, clientX: number, clientY: number) => void;
   isDeleteMode?: boolean;
+  fuelFlows?: { engineId: string, tankIds: string[] }[];
 }
 
 export const RocketRenderer: React.FC<RocketRendererProps> = ({ 
@@ -24,7 +25,8 @@ export const RocketRenderer: React.FC<RocketRendererProps> = ({
   onPartClick,
   onPartContextMenu,
   onPartHover,
-  isDeleteMode = false
+  isDeleteMode = false,
+  fuelFlows
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -49,15 +51,8 @@ export const RocketRenderer: React.FC<RocketRendererProps> = ({
     ctx.clearRect(0, 0, clientWidth, clientHeight);
 
     // Calculate Viewport Transform
-    // ViewBox Center (vbX + vbW/2) should map to Canvas Center
-    // Scale is applied to the viewBox dimensions in SVG terms.
-    // Here we construct the matrix directly.
-    
     const centerX = clientWidth / 2;
     const centerY = clientHeight / 2;
-    
-    // We want the point (bounds.cX, bounds.cY) to be at (centerX, centerY)
-    // And scaled by 'scale'.
     
     ctx.save();
     ctx.translate(centerX, centerY);
@@ -102,11 +97,6 @@ export const RocketRenderer: React.FC<RocketRendererProps> = ({
         ctx.save();
         ctx.translate(ghostPosition.x, ghostPosition.y);
         
-        // Ghost rotation/scale assumptions? 
-        // For now assume standard orientation or pass it down. 
-        // The dragging logic usually keeps rotation 0 unless snapped.
-        // We will just draw it upright or based on context if we had it.
-        
         const width = ghostPart.width * SCALE;
         const height = ghostPart.height * SCALE;
         const style = getPartStyle(ghostPart.type, true);
@@ -123,9 +113,40 @@ export const RocketRenderer: React.FC<RocketRendererProps> = ({
         ctx.restore();
     }
 
+    // Render Fuel Flow Lines
+    if (fuelFlows && fuelFlows.length > 0) {
+        ctx.save();
+        ctx.setLineDash([5, 5]);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#06b6d4'; // Cyan
+        ctx.globalAlpha = 0.8;
+
+        fuelFlows.forEach(flow => {
+             const engine = layout.find(p => p.instanceId === flow.engineId);
+             if (!engine) return;
+
+             flow.tankIds.forEach(tankId => {
+                 const tank = layout.find(p => p.instanceId === tankId);
+                 if (tank) {
+                     ctx.beginPath();
+                     ctx.moveTo(tank.x, tank.y);
+                     ctx.lineTo(engine.x, engine.y);
+                     ctx.stroke();
+                     
+                     // Draw small dot on tank
+                     ctx.beginPath();
+                     ctx.arc(tank.x, tank.y, 4, 0, Math.PI*2);
+                     ctx.fillStyle = '#06b6d4';
+                     ctx.fill();
+                 }
+             });
+        });
+        ctx.restore();
+    }
+
     ctx.restore();
 
-  }, [layout, bounds, scale, ghostPart, ghostPosition, hoveredPartId, isDeleteMode]);
+  }, [layout, bounds, scale, ghostPart, ghostPosition, hoveredPartId, isDeleteMode, fuelFlows]);
 
   // Interaction Handlers
   const getMouseWorldPos = (e: React.MouseEvent) => {
@@ -142,9 +163,6 @@ export const RocketRenderer: React.FC<RocketRendererProps> = ({
       const centerY = height / 2;
 
       // Inverse Transform
-      // Screen = (World - BoundC) * Scale + Center
-      // World = (Screen - Center) / Scale + BoundC
-      
       const worldX = (clientX - centerX) / scale + bounds.cX;
       const worldY = (clientY - centerY) / scale + bounds.cY;
       

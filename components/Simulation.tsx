@@ -1,1183 +1,681 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { RocketPart, PartType, SimulationState, TelemetryPoint, Vector2, Debris, SASMode } from '../types';
-import { Play, Layers, X, Square, Pause, RotateCcw, Move, Anchor, CircleOff, ArrowUpCircle, ArrowDownCircle, Power, Crosshair, Umbrella } from 'lucide-react';
-import { AreaChart, Area, YAxis, ResponsiveContainer, Tooltip } from 'recharts';
+import { RocketPart, PartType, SimulationState, TelemetryPoint, Vector2, SASMode } from '../types';
+import { Play, Layers, Square, Pause, CircleOff, ArrowUpCircle, ArrowDownCircle, X } from 'lucide-react';
 import { calculateRocketLayout, SCALE } from '../utils/rocketUtils';
-import { drawPartShape, getPartStyle, setupCanvas } from '../utils/renderUtils';
+import { drawPartShape, getPartStyle } from '../utils/renderUtils';
+import { getChildrenMap, findFuelSources, isEngineBlockedByStage } from '../utils/fuelUtils';
 
 interface SimulationProps {
   initialParts: RocketPart[];
   onExit: () => void;
 }
 
-// Planetary Constants (Kerbin-like sized planet for better gameplay scaling)
+// Planetary Constants (Kerbin-like)
 const PLANET_RADIUS = 600000; // 600km
 const SURFACE_GRAVITY = 9.81;
-// GM = g * r^2
 const GRAVITATIONAL_PARAM = SURFACE_GRAVITY * PLANET_RADIUS * PLANET_RADIUS; 
-const ATMOSPHERE_HEIGHT = 70000; // 70km
+const ATMOSPHERE_HEIGHT = 70000;
 
-const TIME_STEP = 0.05; 
-const ROTATION_SPEED = 2.0; 
-const THROTTLE_SPEED = 0.5; // Full throttle in 2 seconds
+// Moon Constants ("The Mun")
+const MOON_RADIUS = 200000; 
+const MOON_ORBIT_RADIUS = 12000000; 
+const MOON_SURFACE_GRAVITY = 1.63;
+const MOON_GRAVITATIONAL_PARAM = MOON_SURFACE_GRAVITY * MOON_RADIUS * MOON_RADIUS;
+const MOON_ORBITAL_PERIOD = 2 * Math.PI * Math.sqrt(Math.pow(MOON_ORBIT_RADIUS, 3) / GRAVITATIONAL_PARAM);
+const MOON_SOI_RADIUS = MOON_ORBIT_RADIUS * Math.pow(MOON_GRAVITATIONAL_PARAM / GRAVITATIONAL_PARAM, 2/5);
 
-// SAS Constants
-const SAS_KP = 8.0; // Proportional Gain (Turn strength)
-const SAS_KD = 6.0; // Derivative Gain (Damping)
+const BASE_TIME_STEP = 0.05; 
 
-const NavBall: React.FC<{ rotation: number, position: Vector2, velocity: Vector2, sasMode: SASMode }> = ({ rotation, position, velocity, sasMode }) => {
-    // Math Setup
-    // 1. Planet Up Vector Angle (Radial Out)
-    const planetAngle = Math.atan2(position.y, position.x);
-    
-    // We want the Background (Sky/Ground) to rotate relative to the Rocket.
-    // If Rot increases (tilts right), Background should tilt Left (-).
-    // Angle = (Rad + PI/2) - Rot.
+// Vector Math Helpers
+const vAdd = (a: Vector2, b: Vector2) => ({ x: a.x + b.x, y: a.y + b.y });
+const vScale = (v: Vector2, s: number) => ({ x: v.x * s, y: v.y * s });
+const vMag = (v: Vector2) => Math.sqrt(v.x * v.x + v.y * v.y);
+const vNorm = (v: Vector2) => { const m = vMag(v); return m === 0 ? { x: 0, y: 0 } : vScale(v, 1/m); };
+const vDot = (a: Vector2, b: Vector2) => a.x * b.x + a.y * b.y;
+
+// NavBall Component (Internal)
+const NavBall: React.FC<{ rotation: number, velocity: Vector2, sasMode: SASMode, nearestBodyAngle: number }> = ({ rotation, velocity, sasMode, nearestBodyAngle }) => {
     const rad2deg = 180 / Math.PI;
-    const bgRotation = ((planetAngle + Math.PI/2) - rotation) * rad2deg;
+    // The background rotates to show "Up" (Radial Out) relative to the rocket
+    const bgRotation = ((nearestBodyAngle + Math.PI/2) - rotation) * rad2deg;
     
-    // Prograde Marker Rotation (relative to Visual Up)
-    // If Vel aligns with Rocket, rotation should be 0.
-    const velocityAngle = Math.atan2(velocity.y, velocity.x);
-    const progradeRotation = (velocityAngle - (rotation - Math.PI/2)) * rad2deg;
-    const retrogradeRotation = progradeRotation + 180;
-    
-    // SAS Target Markers
-    let sasTargetRot: number | null = null;
-    let sasIcon = null;
-    
-    if (sasMode === SASMode.PROGRADE) {
-        sasTargetRot = progradeRotation;
-        sasIcon = <ArrowUpCircle size={12} className="text-green-400" strokeWidth={3}/>;
-    } else if (sasMode === SASMode.RETROGRADE) {
-        sasTargetRot = retrogradeRotation;
-        sasIcon = <ArrowDownCircle size={12} className="text-orange-400" strokeWidth={3}/>;
-    } else if (sasMode === SASMode.STABILITY) {
-        // Stability holds current, so marker is center
-        sasTargetRot = 0; 
-        sasIcon = <CircleOff size={12} className="text-cyan-400" strokeWidth={3}/>;
-    }
-
-    // Determine if prograde is visible (speed > 1m/s)
-    const showPrograde = (velocity.x**2 + velocity.y**2) > 1;
+    // Prograde/Retrograde relative to Rocket Frame
+    const velAngle = Math.atan2(velocity.y, velocity.x);
+    const progradeRot = (velAngle - (rotation - Math.PI/2)) * rad2deg;
+    const retrogradeRot = progradeRot + 180;
+    const speed = vMag(velocity);
 
     return (
-        <div className="relative w-32 h-32 rounded-full border-4 border-slate-600 bg-slate-800 overflow-hidden shadow-2xl">
-            {/* Rotating Background (Gyro) */}
-            <div 
-                className="absolute inset-[-50%] w-[200%] h-[200%] origin-center"
-                style={{ 
-                    background: 'linear-gradient(to bottom, #3b82f6 50%, #854d0e 50%)',
-                    transform: `rotate(${bgRotation}deg)`
-                }}
-            >
-                {/* Horizon Line */}
+        <div className="relative w-32 h-32 rounded-full border-4 border-slate-600 bg-slate-800 overflow-hidden shadow-2xl shrink-0">
+             <div className="absolute inset-[-50%] w-[200%] h-[200%] origin-center transition-transform duration-75"
+                style={{ background: 'linear-gradient(to bottom, #3b82f6 50%, #854d0e 50%)', transform: `rotate(${bgRotation}deg)` }}>
                 <div className="absolute top-1/2 left-0 w-full h-0.5 bg-white/50 -mt-[1px]"></div>
             </div>
-
-            {/* Crosshair (Fixed Rocket Reference) */}
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-80">
-                <div className="w-8 h-1 bg-orange-500 rounded-full absolute"></div>
-                <div className="w-1 h-4 bg-orange-500 rounded-full absolute -mt-2"></div>
+            {/* Crosshair (Rocket) */}
+            <div className="absolute inset-0 flex items-center justify-center opacity-80 pointer-events-none">
+                 <div className="w-8 h-1 bg-orange-500 rounded-full absolute"></div>
+                 <div className="w-1 h-4 bg-orange-500 rounded-full absolute -mt-2"></div>
             </div>
-
-            {/* Markers Container - Rotated relative to rocket */}
-            
-            {showPrograde && (
+            {speed > 1 && (
                 <>
-                    {/* Prograde */}
-                    <div 
-                        className="absolute top-1/2 left-1/2 w-0 h-0 flex items-center justify-center"
-                        style={{ transform: `rotate(${progradeRotation}deg) translateY(-54px)` }}
-                    >
-                         <div className="w-4 h-4 rounded-full border-2 border-green-400 flex items-center justify-center">
-                             <div className="w-1 h-1 bg-green-400 rounded-full"></div>
-                             <div className="absolute -top-2 w-[2px] h-2 bg-green-400"></div>
-                             <div className="absolute -left-2 w-2 h-[2px] bg-green-400"></div>
-                             <div className="absolute -right-2 w-2 h-[2px] bg-green-400"></div>
-                         </div>
-                    </div>
-                    {/* Retrograde */}
-                     <div 
-                        className="absolute top-1/2 left-1/2 w-0 h-0 flex items-center justify-center"
-                        style={{ transform: `rotate(${retrogradeRotation}deg) translateY(-54px)` }}
-                    >
-                         <div className="w-4 h-4 rounded-full border-2 border-red-500 flex items-center justify-center relative">
-                             <div className="w-3 h-[2px] bg-red-500 transform rotate-45"></div>
-                             <div className="w-3 h-[2px] bg-red-500 transform -rotate-45"></div>
-                         </div>
-                    </div>
+                <div className="absolute top-1/2 left-1/2 w-0 h-0 flex items-center justify-center transition-transform duration-75" style={{ transform: `rotate(${progradeRot}deg) translateY(-54px)` }}>
+                     <div className="w-4 h-4 rounded-full border-2 border-green-400 flex items-center justify-center">
+                         <div className="w-1 h-1 bg-green-400 rounded-full"></div>
+                     </div>
+                </div>
+                 <div className="absolute top-1/2 left-1/2 w-0 h-0 flex items-center justify-center transition-transform duration-75" style={{ transform: `rotate(${retrogradeRot}deg) translateY(-54px)` }}>
+                     <div className="w-4 h-4 rounded-full border-2 border-red-500 flex items-center justify-center">
+                        <X size={12} className="text-red-500"/>
+                     </div>
+                </div>
                 </>
             )}
-
-            {/* SAS Target Ghost Marker */}
-            {sasTargetRot !== null && (
-                 <div 
-                    className="absolute top-1/2 left-1/2 w-0 h-0 flex items-center justify-center opacity-70"
-                    style={{ transform: `rotate(${sasTargetRot}deg) translateY(-40px)` }}
-                >
-                    {sasIcon}
-                </div>
-            )}
-            
-            {/* Glass Glare */}
-            <div className="absolute inset-0 rounded-full bg-gradient-to-tr from-transparent to-white/10 pointer-events-none"></div>
         </div>
     );
 };
 
 export const Simulation: React.FC<SimulationProps> = ({ initialParts, onExit }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [zoom, setZoom] = useState(0.5); // Start zoomed out a bit to see context
-  const zoomRef = useRef(0.5); 
-  const [showForces, setShowForces] = useState(false);
   
+  // Simulation Settings
+  // Default Zoom: 40 pixels per meter (Matches builder scale roughly)
+  const [zoom, setZoom] = useState(40); 
+  const zoomRef = useRef(zoom); // Ref for game loop access
+  const [timeWarp, setTimeWarp] = useState(1);
+  const timeWarpRef = useRef(timeWarp);
+  const [focusBody, setFocusBody] = useState<'ROCKET' | 'MOON' | 'PLANET'>('ROCKET');
+  const focusBodyRef = useRef(focusBody);
+
+  // Initial State: Launchpad at (0, -Radius) - Exactly on surface
+  const initialPos = { x: 0, y: -PLANET_RADIUS }; 
+
   const [activeParts, setActiveParts] = useState<RocketPart[]>(() => JSON.parse(JSON.stringify(initialParts)));
   
-  const keysRef = useRef({ left: false, right: false, shift: false, ctrl: false });
-  
-  // Initialize on the "North Pole" of the planet (0, -Radius)
+  const keysRef = useRef({ left: false, right: false, shift: false, ctrl: false, z: false, x: false });
+  const [throttle, setThrottle] = useState(0); // Start at 0%
+  const [sasMode, setSasMode] = useState<SASMode>(SASMode.STABILITY);
+  const [targetRotation, setTargetRotation] = useState(0); 
+
   const [simState, setSimState] = useState<SimulationState>({
-    position: { x: 0, y: -PLANET_RADIUS - 2 }, // Start 2m above surface
+    position: initialPos,
     velocity: { x: 0, y: 0 },
-    rotation: 0, 
+    rotation: 0,
     angularVelocity: 0,
-    throttle: 1.0,
+    throttle: 0, // Start zero throttle
     sasMode: SASMode.STABILITY,
     altitude: 0,
     velocityMag: 0,
     verticalVelocity: 0,
     horizontalVelocity: 0,
     acceleration: 0,
+    time: 0,
     semiMajorAxis: 0,
     eccentricity: 0,
     apoapsis: 0,
     periapsis: 0,
-    time: 0,
     parts: activeParts,
     debris: [],
-    active: false,
+    active: true, // Start active (physics running but rocket sits on pad)
     finished: false,
     maxAltitude: 0,
     events: [],
-    forces: {
-        thrust: { x: 0, y: 0 },
-        gravity: { x: 0, y: 0 },
-        drag: { x: 0, y: 0 }
-    }
+    forces: { thrust: {x:0, y:0}, gravity: {x:0, y:0}, drag: {x:0, y:0} }
   });
-  
-  const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
+
   const requestRef = useRef<number>(0);
   const stateRef = useRef(simState);
-  const showForcesRef = useRef(showForces);
 
+  // Sync State Ref
   useEffect(() => {
-      showForcesRef.current = showForces;
-  }, [showForces]);
-  
-  useEffect(() => {
-    stateRef.current = {
-        ...stateRef.current,
-        active: simState.active,
-        finished: simState.finished,
-        parts: activeParts,
-        sasMode: simState.sasMode // Sync SAS mode on external change
-    };
-  }, [simState.active, simState.finished, activeParts, simState.sasMode]);
-
-  const deployParachutes = useCallback(() => {
-      const updatedParts = stateRef.current.parts.map(p => {
-          if (p.type === PartType.PARACHUTE) {
-              return { ...p, isDeployed: true };
-          }
-          return p;
-      });
-      setActiveParts(updatedParts);
-      // Update event log
-      const newEvents = [...stateRef.current.events, `T+${stateRef.current.time.toFixed(1)}s: Parachutes Deployed`];
-      stateRef.current = { ...stateRef.current, parts: updatedParts, events: newEvents };
-      setSimState(stateRef.current);
-  }, []);
+    stateRef.current = { ...stateRef.current, active: simState.active, finished: simState.finished, parts: activeParts, throttle, sasMode };
+    zoomRef.current = zoom;
+    timeWarpRef.current = timeWarp;
+    focusBodyRef.current = focusBody;
+  }, [simState.active, simState.finished, activeParts, throttle, sasMode, zoom, timeWarp, focusBody]);
 
   // Input Listeners
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'ArrowLeft') keysRef.current.left = true;
       if (e.key === 'ArrowRight') keysRef.current.right = true;
-      if (e.key === 'Shift') keysRef.current.shift = true;
-      if (e.key === 'Control') keysRef.current.ctrl = true;
-      
-      if (e.key.toLowerCase() === 'z') {
-           stateRef.current.throttle = 1.0;
-           setSimState(prev => ({ ...prev, throttle: 1.0 }));
-      }
-      if (e.key.toLowerCase() === 'x') {
-           stateRef.current.throttle = 0.0;
-           setSimState(prev => ({ ...prev, throttle: 0.0 }));
-      }
-      if (e.key.toLowerCase() === 'p') {
-          deployParachutes();
-      }
-      // SAS Shortcuts
-      if (e.key.toLowerCase() === 't') {
-          // Toggle stability
-          const newMode = stateRef.current.sasMode === SASMode.STABILITY ? SASMode.MANUAL : SASMode.STABILITY;
-          stateRef.current.sasMode = newMode;
-          setSimState(prev => ({ ...prev, sasMode: newMode }));
-      }
+      if (e.key === 'Shift') setThrottle(t => Math.min(1, t + 0.1));
+      if (e.key === 'Control') setThrottle(t => Math.max(0, t - 0.1));
+      if (e.key === 'z') setThrottle(1);
+      if (e.key === 'x') setThrottle(0);
+      if (e.key === 't') setSasMode(m => m === SASMode.STABILITY ? SASMode.MANUAL : SASMode.STABILITY);
+      if (e.key === '.') setTimeWarp(w => Math.min(100, w === 0 ? 1 : w < 5 ? w + 1 : w * 2));
+      if (e.key === ',') setTimeWarp(w => Math.max(1, w > 5 ? w / 2 : w - 1));
     };
     const handleKeyUp = (e: KeyboardEvent) => {
       if (e.key === 'ArrowLeft') keysRef.current.left = false;
       if (e.key === 'ArrowRight') keysRef.current.right = false;
-      if (e.key === 'Shift') keysRef.current.shift = false;
-      if (e.key === 'Control') keysRef.current.ctrl = false;
     };
     const handleWheel = (e: WheelEvent) => {
-        // Updated zoom limit to allow seeing whole planet
-        const newZoom = Math.max(0.000002, Math.min(zoomRef.current - e.deltaY * 0.001 * zoomRef.current, 50));
-        zoomRef.current = newZoom;
-        setZoom(newZoom);
+        // Max zoom increased to 200 for close-ups
+        setZoom(prev => Math.max(0.00001, Math.min(prev * (1 - e.deltaY * 0.001), 200)));
     };
-
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
     window.addEventListener('wheel', handleWheel);
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-      window.removeEventListener('wheel', handleWheel);
+        window.removeEventListener('keydown', handleKeyDown);
+        window.removeEventListener('keyup', handleKeyUp);
+        window.removeEventListener('wheel', handleWheel);
     };
-  }, [deployParachutes]);
+  }, []);
 
-  const updatePhysics = useCallback(() => {
+  // --- RENDERING FUNCTION (Defined before loop) ---
+  const drawFrame = () => {
+     if (!canvasRef.current) return;
+     const ctx = canvasRef.current.getContext('2d');
+     if (!ctx) return;
+     const { width, height } = canvasRef.current;
+     const state = stateRef.current;
+     const zoom = zoomRef.current;
+     const focusBody = focusBodyRef.current;
+     
+     const moonAngle = (state.time / MOON_ORBITAL_PERIOD) * 2 * Math.PI;
+     const moonPos = { x: Math.cos(moonAngle) * MOON_ORBIT_RADIUS, y: Math.sin(moonAngle) * MOON_ORBIT_RADIUS };
+     
+     // Camera Transform
+     let camX = state.position.x;
+     let camY = state.position.y;
+     if (focusBody === 'MOON') { camX = moonPos.x; camY = moonPos.y; }
+     if (focusBody === 'PLANET') { camX = 0; camY = 0; }
+     
+     ctx.fillStyle = '#0f172a';
+     ctx.fillRect(0,0,width,height);
+     
+     ctx.save();
+     ctx.translate(width/2, height/2);
+     ctx.scale(zoom, zoom);
+     ctx.translate(-camX, -camY);
+
+     // 1. Planet
+     ctx.fillStyle = '#3b82f6';
+     ctx.beginPath(); ctx.arc(0, 0, PLANET_RADIUS, 0, Math.PI*2); ctx.fill();
+     ctx.fillStyle = 'rgba(59, 130, 246, 0.2)';
+     ctx.beginPath(); ctx.arc(0, 0, PLANET_RADIUS + ATMOSPHERE_HEIGHT, 0, Math.PI*2); ctx.fill();
+     // Planet Grid
+     ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+     ctx.lineWidth = PLANET_RADIUS / 20;
+     ctx.beginPath(); ctx.moveTo(0, -PLANET_RADIUS); ctx.lineTo(0, PLANET_RADIUS); ctx.stroke();
+     ctx.beginPath(); ctx.moveTo(-PLANET_RADIUS, 0); ctx.lineTo(PLANET_RADIUS, 0); ctx.stroke();
+
+     // 2. Moon
+     ctx.fillStyle = '#94a3b8';
+     ctx.beginPath(); ctx.arc(moonPos.x, moonPos.y, MOON_RADIUS, 0, Math.PI*2); ctx.fill();
+     // Craters
+     ctx.fillStyle = '#64748b';
+     ctx.beginPath(); ctx.arc(moonPos.x + MOON_RADIUS*0.3, moonPos.y - MOON_RADIUS*0.2, MOON_RADIUS*0.2, 0, Math.PI*2); ctx.fill();
+     
+     // 3. Orbit Line
+     ctx.strokeStyle = '#334155';
+     ctx.lineWidth = 1 / zoom;
+     ctx.beginPath(); ctx.arc(0, 0, MOON_ORBIT_RADIUS, 0, Math.PI*2); ctx.stroke();
+
+     // 4. Rocket
+     // Draw Icon if zoomed out
+     if (zoom < 0.1) {
+         ctx.fillStyle = '#facc15';
+         const iconSize = 10 / zoom;
+         ctx.beginPath(); ctx.arc(state.position.x, state.position.y, iconSize, 0, Math.PI*2); ctx.fill();
+     } else {
+         // Draw Parts
+         ctx.translate(state.position.x, state.position.y);
+         ctx.rotate(state.rotation);
+         const layout = calculateRocketLayout(state.parts);
+         layout.forEach(p => {
+             ctx.save();
+             // Convert pixels from layout to meters
+             ctx.translate(p.x/SCALE, p.y/SCALE); 
+             ctx.rotate(p.rotation);
+             if (p.radialOffset === -1) ctx.scale(-1, 1);
+             const style = getPartStyle(p.type);
+             ctx.fillStyle = style.fill;
+             ctx.strokeStyle = style.stroke;
+             ctx.lineWidth = 0.1;
+             drawPartShape(ctx, p.type, p.width, p.height, p.isThrusting); 
+             ctx.fill();
+             ctx.stroke();
+
+             // Fuel Level Overlay
+             if (p.type === PartType.TANK && p.fuelCapacity && p.currentFuel !== undefined) {
+                 const fuelRatio = p.currentFuel / p.fuelCapacity;
+                 const fuelHeight = p.height * fuelRatio;
+                 
+                 ctx.save();
+                 // Create clip from the tank shape to handle rounded corners
+                 drawPartShape(ctx, p.type, p.width, p.height, false);
+                 ctx.clip();
+                 
+                 const hh = p.height / 2;
+                 const hw = p.width / 2;
+                 
+                 ctx.fillStyle = 'rgba(6, 182, 212, 0.4)'; // Cyan-ish transparency
+                 // Draw from bottom up
+                 ctx.fillRect(-hw, hh - fuelHeight, p.width, fuelHeight);
+                 ctx.restore();
+             }
+
+             // Engine Flame
+             if (p.type === PartType.ENGINE && p.isThrusting) {
+                 ctx.fillStyle = '#f97316';
+                 ctx.beginPath();
+                 ctx.moveTo(-p.width/4, p.height/2);
+                 ctx.lineTo(p.width/4, p.height/2);
+                 ctx.lineTo(0, p.height/2 + 2 + Math.random()*2); 
+                 ctx.fill();
+             }
+             ctx.restore();
+         });
+     }
+     ctx.restore();
+  };
+
+  // --- PHYSICS ENGINE ---
+  const updatePhysics = () => {
     const currentState = stateRef.current;
-    if (currentState.finished) return; 
-    if (!currentState.active) return;
+    if (!currentState.active || currentState.finished) return;
 
-    let { position, velocity, rotation, angularVelocity, time, maxAltitude, events, debris, parts, throttle, sasMode } = currentState;
+    let { position, velocity, rotation, angularVelocity, time, parts, events, maxAltitude } = currentState;
+    const warp = timeWarpRef.current;
     
-    // Throttle Input
-    if (keysRef.current.shift) {
-        throttle = Math.min(1.0, throttle + THROTTLE_SPEED * TIME_STEP);
-    }
-    if (keysRef.current.ctrl) {
-        throttle = Math.max(0.0, throttle - THROTTLE_SPEED * TIME_STEP);
-    }
+    // Run physics steps based on Time Warp
+    const steps = Math.max(1, Math.floor(warp)); 
+    const maxSteps = 10; 
+    const effectiveSteps = Math.min(steps, maxSteps);
+    const dt = BASE_TIME_STEP * (steps / effectiveSteps); 
 
-    // 1. Calculate Mass & Thrust
-    let mass = 0;
-    let dragArea = 0;
-    let finArea = 0;
-    parts.forEach(p => {
-        const fuel = p.currentFuel || 0;
-        mass += p.mass + fuel;
+    // Build Connectivity Map for Fuel Flow (BFS)
+    const childrenMap = getChildrenMap(parts);
+
+    for(let s = 0; s < effectiveSteps; s++) {
+        time += dt;
+
+        // 1. Celestial Positions
+        const moonAngle = (time / MOON_ORBITAL_PERIOD) * 2 * Math.PI;
+        const moonPos = { x: Math.cos(moonAngle) * MOON_ORBIT_RADIUS, y: Math.sin(moonAngle) * MOON_ORBIT_RADIUS };
+
+        // 2. Mass Properties
+        let mass = 0;
+        let momentOfInertia = 0;
+        let dragArea = 0;
         
-        // Drag Calculation
-        if (p.type === PartType.PARACHUTE && p.isDeployed) {
-            dragArea += 500; // Massive drag for chutes
-        } else {
+        parts.forEach(p => {
+            const m = p.mass + (p.currentFuel || 0);
+            mass += m;
             dragArea += p.width * p.width; 
+            momentOfInertia += m * 10; 
+        });
+        momentOfInertia = Math.max(momentOfInertia, 100);
+
+        // 3. Gravity (N-Body)
+        // Planet
+        const r2 = position.x*position.x + position.y*position.y;
+        const r = Math.sqrt(r2);
+        const fGravityP = -GRAVITATIONAL_PARAM / r2; 
+        const gVecP = { x: fGravityP * (position.x/r), y: fGravityP * (position.y/r) };
+
+        // Moon
+        const dMx = position.x - moonPos.x;
+        const dMy = position.y - moonPos.y;
+        const rm2 = dMx*dMx + dMy*dMy;
+        const rm = Math.sqrt(rm2);
+        const fGravityM = -MOON_GRAVITATIONAL_PARAM / rm2;
+        const gVecM = { x: fGravityM * (dMx/rm), y: fGravityM * (dMy/rm) };
+
+        const totalGravity = vAdd(gVecP, gVecM);
+
+        // 4. Atmosphere & Drag
+        const altitudeSea = r - PLANET_RADIUS;
+        let density = 0;
+        if (altitudeSea < ATMOSPHERE_HEIGHT) {
+            density = 1.225 * Math.exp(-altitudeSea / 7000);
         }
         
-        if (p.type === PartType.FIN) finArea += 1.0; 
-    });
-
-    let totalThrust = 0;
-    // Reset thrust flags
-    parts.forEach(p => p.isThrusting = false);
-    
-    const engines = parts.filter(p => p.type === PartType.ENGINE);
-    let anyEngineHasFuel = false;
-
-    // BFS Fuel Logic
-    engines.forEach(eng => {
-        const obstructed = parts.some(p => p.parentId === eng.instanceId && p.parentNodeId === 'bottom');
-        if (obstructed) return;
-
-        const sourceTanks: RocketPart[] = [];
-        const visited = new Set<string>();
-        const queue = [eng];
-        visited.add(eng.instanceId);
-
-        if ((eng.currentFuel || 0) > 0) sourceTanks.push(eng);
-
-        while (queue.length > 0) {
-            const curr = queue.shift()!;
-            const neighbors: RocketPart[] = [];
-            if (curr.parentId) {
-                const parent = parts.find(p => p.instanceId === curr.parentId);
-                if (parent) neighbors.push(parent);
-            }
-            const children = parts.filter(p => p.parentId === curr.instanceId);
-            neighbors.push(...children);
-            
-            for (const neighbor of neighbors) {
-                if (visited.has(neighbor.instanceId)) continue;
-                if (neighbor.type === PartType.DECOUPLER) {
-                    visited.add(neighbor.instanceId);
-                    continue;
-                }
-                visited.add(neighbor.instanceId);
-                if (neighbor.type === PartType.TANK && (neighbor.currentFuel || 0) > 0) {
-                    sourceTanks.push(neighbor);
-                }
-                queue.push(neighbor);
-            }
+        const speedSq = vDot(velocity, velocity);
+        const speed = Math.sqrt(speedSq);
+        let dragForce = { x: 0, y: 0 };
+        
+        if (density > 0 && speed > 0.1) {
+             const dragMag = 0.5 * density * speedSq * dragArea * 0.2; 
+             const velDir = vNorm(velocity);
+             dragForce = vScale(velDir, -dragMag);
         }
 
-        const availableInStage = sourceTanks.reduce((sum, t) => sum + (t.currentFuel || 0), 0);
+        // 5. Thrust & Fuel Logic
+        let totalThrust = 0;
+        const thrustDir = { x: Math.sin(rotation), y: -Math.cos(rotation) }; 
+        const currentThrottle = stateRef.current.throttle;
         
-        if (availableInStage > 0.001) {
-            anyEngineHasFuel = true;
-            if (throttle > 0) {
-                const idealFuelNeeded = (eng.burnRate || 0) * throttle * TIME_STEP;
-                let actualFuelConsumed = idealFuelNeeded;
-                let thrustRatio = 1.0;
-                
-                if (idealFuelNeeded > availableInStage) {
-                    actualFuelConsumed = availableInStage;
-                    thrustRatio = availableInStage / idealFuelNeeded;
-                }
+        if (currentThrottle > 0) {
+            parts.forEach(p => {
+                if (p.type === PartType.ENGINE) {
+                    // Check Staging: If blocked by a stack decoupler, it shouldn't fire.
+                    const isBlocked = isEngineBlockedByStage(p, childrenMap);
+                    
+                    if (!isBlocked) {
+                        const maxT = p.thrust || 0;
+                        if (maxT > 0) {
+                            const requiredFuel = (p.burnRate || 0) * currentThrottle * dt;
 
-                eng.isThrusting = true;
-                totalThrust += (eng.thrust || 0) * throttle * thrustRatio;
-                
-                if (actualFuelConsumed > 0) {
-                    let remainingToDrain = actualFuelConsumed;
-                    let attempts = 0;
-                    while (remainingToDrain > 0.000001 && attempts < 3) {
-                        const activeTanks = sourceTanks.filter(t => (t.currentFuel || 0) > 0);
-                        if (activeTanks.length === 0) break;
-                        const drainPerTank = remainingToDrain / activeTanks.length;
-                        activeTanks.forEach(t => {
-                            const current = t.currentFuel || 0;
-                            const drain = Math.min(current, drainPerTank);
-                            t.currentFuel = current - drain;
-                            remainingToDrain -= drain;
-                        });
-                        attempts++;
+                            // Use shared logic for fuel source discovery
+                            const allPossibleSources = findFuelSources(p, parts, childrenMap);
+                            
+                            // Filter for sources that actually have fuel remaining
+                            const fuelSources = allPossibleSources.filter(s => (s.part.currentFuel || 0) > 0.000001); // Strict threshold
+                            let totalFuelAvailable = fuelSources.reduce((sum, s) => sum + (s.part.currentFuel || 0), 0);
+
+                            // Burn Logic
+                            if (totalFuelAvailable >= requiredFuel && requiredFuel > 0) {
+                                let remainingBurn = requiredFuel;
+
+                                // Group by distance
+                                const groups = new Map<number, RocketPart[]>();
+                                fuelSources.forEach(s => {
+                                    if (!groups.has(s.dist)) groups.set(s.dist, []);
+                                    groups.get(s.dist)!.push(s.part);
+                                });
+
+                                // Sort distances DESCENDING (Drain furthest tanks first)
+                                const sortedDistances = Array.from(groups.keys()).sort((a, b) => b - a);
+
+                                for (const dist of sortedDistances) {
+                                    if (remainingBurn <= 0) break;
+                                    
+                                    const tanks = groups.get(dist)!;
+                                    // Recalculate group total (in case of floating point drift, though purely local here)
+                                    const groupTotal = tanks.reduce((sum, t) => sum + (t.currentFuel || 0), 0);
+                                    
+                                    const take = Math.min(groupTotal, remainingBurn);
+                                    
+                                    if (groupTotal > 0) {
+                                        tanks.forEach(t => {
+                                            // Proportional drain: ensures tanks drain evenly relative to their size
+                                            const fraction = (t.currentFuel || 0) / groupTotal;
+                                            const amount = take * fraction;
+                                            t.currentFuel = Math.max(0, (t.currentFuel || 0) - amount);
+                                            // Prevent tiny residuals
+                                            if (t.currentFuel < 0.000001) t.currentFuel = 0;
+                                        });
+                                    }
+                                    
+                                    remainingBurn -= take;
+                                }
+                                
+                                totalThrust += maxT * currentThrottle;
+                                p.isThrusting = true;
+                            } else if (totalFuelAvailable > 0) {
+                                // Partial burn
+                                fuelSources.forEach(s => s.part.currentFuel = 0);
+                                const ratio = requiredFuel > 0 ? totalFuelAvailable / requiredFuel : 0;
+                                totalThrust += maxT * currentThrottle * ratio;
+                                // Only visual thrust if significant
+                                p.isThrusting = ratio > 0.01;
+                            } else {
+                                p.isThrusting = false;
+                            }
+                        }
+                    } else {
+                        p.isThrusting = false;
                     }
+                } else {
+                    p.isThrusting = false;
                 }
-            }
+            });
         } else {
-             eng.isThrusting = false;
+            parts.forEach(p => p.isThrusting = false);
         }
-    });
 
-    if (!anyEngineHasFuel && engines.length > 0 && totalThrust === 0 && throttle > 0) {
-        if (!events.some(e => e.includes('Burnout'))) events = [...events, `T+${time.toFixed(1)}s: Burnout`];
-    }
+        const thrustVec = vScale(thrustDir, totalThrust);
 
-    // 2. Orbital Physics
-    const distSq = position.x*position.x + position.y*position.y;
-    const dist = Math.sqrt(distSq);
-    const altitude = dist - PLANET_RADIUS;
-    
-    const gravAccelMag = GRAVITATIONAL_PARAM / distSq;
-    const gravAccelX = -position.x / dist * gravAccelMag;
-    const gravAccelY = -position.y / dist * gravAccelMag;
-
-    const rho = altitude < ATMOSPHERE_HEIGHT 
-        ? 1.225 * Math.exp(-altitude / 7000) 
-        : 0;
-
-    const speedSq = velocity.x*velocity.x + velocity.y*velocity.y;
-    const speed = Math.sqrt(speedSq);
-
-    const rVector = { x: position.x, y: position.y };
-    const vVector = { x: velocity.x, y: velocity.y };
-    
-    const specificEnergy = (speedSq)/2 - GRAVITATIONAL_PARAM/dist;
-    const semiMajorAxis = -GRAVITATIONAL_PARAM / (2 * specificEnergy);
-    const h = rVector.x * vVector.y - rVector.y * vVector.x;
-    const eccentricity = Math.sqrt(Math.max(0, 1 + (2 * specificEnergy * h * h) / (GRAVITATIONAL_PARAM * GRAVITATIONAL_PARAM)));
-    
-    let periapsis = 0;
-    let apoapsis = 0;
-    if (eccentricity < 1) {
-        periapsis = semiMajorAxis * (1 - eccentricity) - PLANET_RADIUS;
-        apoapsis = semiMajorAxis * (1 + eccentricity) - PLANET_RADIUS;
-    } else {
-        periapsis = semiMajorAxis * (1 - eccentricity) - PLANET_RADIUS;
-        apoapsis = Infinity;
-    }
-
-    const vVert = (velocity.x * position.x + velocity.y * position.y) / dist;
-    const vHoriz = Math.abs((velocity.x * -position.y + velocity.y * position.x) / dist);
-
-    let dragFx = 0;
-    let dragFy = 0;
-    if (rho > 0 && speed > 0) {
-        const dragForce = 0.5 * rho * speedSq * (dragArea * 0.05);
-        const dragAx = -velocity.x / speed;
-        const dragAy = -velocity.y / speed;
-        dragFx = dragAx * dragForce;
-        dragFy = dragAy * dragForce;
-    }
-
-    const thrustX = Math.sin(rotation) * totalThrust;
-    const thrustY = -Math.cos(rotation) * totalThrust;
-
-    let torque = 0;
-    if (rho > 0 && finArea > 0 && speed > 10) {
-        const velAngle = Math.atan2(velocity.y, velocity.x);
-        const mathRotation = rotation - Math.PI / 2;
-        let aoa = velAngle - mathRotation;
-        while (aoa > Math.PI) aoa -= Math.PI*2;
-        while (aoa < -Math.PI) aoa += Math.PI*2;
+        // 6. Rotation (SAS & Input)
+        let controlTorque = 0;
+        if (keysRef.current.left) controlTorque -= 10000;
+        if (keysRef.current.right) controlTorque += 10000;
         
-        torque = aoa * speed * finArea * 500; 
-        torque -= angularVelocity * speed * finArea * 50;
-    }
-    
-    // --- Attitude Control System (SAS) ---
-    const MOI = Math.max(mass * 20, 100); 
-    const isManualInput = keysRef.current.left || keysRef.current.right;
-
-    if (isManualInput) {
-        // Manual Override
-        if (keysRef.current.left) torque -= ROTATION_SPEED * MOI;
-        if (keysRef.current.right) torque += ROTATION_SPEED * MOI;
-    } else if (sasMode !== SASMode.MANUAL) {
         // SAS Logic
-        let targetRotation: number | null = null;
-        
-        // Only calculate Prograde/Retrograde if moving fast enough to have a stable vector
-        if (speed > 1.0) {
-            const velocityAngle = Math.atan2(velocity.y, velocity.x);
-            // Visual UP is 0 rotation, which corresponds to Vector(0, -1). 
-            // In standard math, (0, -1) is -PI/2.
-            // So Rotation 0 = Math Angle -PI/2.
-            // Therefore Math Angle = Rotation - PI/2.
-            // Or Rotation = Math Angle + PI/2.
-            
-            if (sasMode === SASMode.PROGRADE) {
-                targetRotation = velocityAngle + Math.PI / 2;
-            } else if (sasMode === SASMode.RETROGRADE) {
-                targetRotation = velocityAngle + Math.PI / 2 + Math.PI;
+        const sas = stateRef.current.sasMode;
+        if (sas !== SASMode.MANUAL) {
+            let target = targetRotation; // use default manual target?
+            // Actually, keep stability relative to current unless specific mode
+            if (sas === SASMode.PROGRADE && speed > 1) {
+                target = Math.atan2(velocity.y, velocity.x) + Math.PI/2;
+            } else if (sas === SASMode.RETROGRADE && speed > 1) {
+                target = Math.atan2(velocity.y, velocity.x) - Math.PI/2;
+            } else if (sas === SASMode.STABILITY) {
+                 // Damping only
+                 controlTorque -= angularVelocity * momentOfInertia * 2.0; 
             }
-        } 
-        
-        // If mode is Prograde/Retrograde but speed is low, targetRotation is null.
-        // In this case, we default to Stability logic (holding attitude/killing rotation).
-
-        if (targetRotation === null) {
-            // Kill Rotation: PID Target Rate = 0
-            // Torque = (TargetRate - CurrentRate) * KD
-            torque -= angularVelocity * SAS_KD * MOI; 
-        } else {
-            // Aim at Target: PID Controller
-            let error = targetRotation - rotation;
-            // Normalize error to -PI to PI
-            while (error > Math.PI) error -= Math.PI * 2;
-            while (error < -Math.PI) error += Math.PI * 2;
-
-            // PD Controller
-            // Output = Kp * error - Kd * velocity
-            const controlSignal = (error * SAS_KP - angularVelocity * SAS_KD);
             
-            // Clamp torque so we don't spin wildly physically
-            torque += controlSignal * MOI; 
-        }
-    }
-    // If MANUAL mode and no input, torque remains 0 (or whatever aero torque was calculated)
-
-    const angularAccel = torque / MOI;
-    angularVelocity += angularAccel * TIME_STEP;
-    rotation += angularVelocity * TIME_STEP;
-    
-    const ax = (thrustX + dragFx) / mass + gravAccelX;
-    const ay = (thrustY + dragFy) / mass + gravAccelY;
-
-    velocity.x += ax * TIME_STEP;
-    velocity.y += ay * TIME_STEP;
-    position.x += velocity.x * TIME_STEP;
-    position.y += velocity.y * TIME_STEP;
-
-    // Collision Detection
-    let active: boolean = currentState.active;
-    let finished: boolean = currentState.finished;
-
-    if (dist < PLANET_RADIUS) {
-        position.x = (position.x / dist) * PLANET_RADIUS;
-        position.y = (position.y / dist) * PLANET_RADIUS;
-        
-        if (speed > 10) {
-             events = [...events, `T+${time.toFixed(1)}s: Impact at ${speed.toFixed(0)} m/s`];
-             active = false;
-             finished = true;
-             velocity = {x:0, y:0};
+            if (sas !== SASMode.STABILITY) {
+                let err = target - rotation;
+                while (err > Math.PI) err -= Math.PI*2;
+                while (err < -Math.PI) err += Math.PI*2;
+                const P = err * 20000; 
+                const D = angularVelocity * 20000; 
+                controlTorque += (P - D);
+            }
         } else {
-             if (speed > 0.1 && !events.some(e => e.includes('Touchdown'))) events = [...events, `T+${time.toFixed(1)}s: Touchdown`];
-             velocity = {x:0, y:0};
-             angularVelocity = 0;
+             controlTorque -= angularVelocity * momentOfInertia * 0.1; 
+        }
+
+        const alpha = controlTorque / momentOfInertia;
+        angularVelocity += alpha * dt;
+        rotation += angularVelocity * dt;
+
+        // 7. Integration
+        const force = vAdd(vAdd(totalGravity, dragForce), thrustVec);
+        const accel = vScale(force, 1/mass);
+        
+        velocity = vAdd(velocity, vScale(accel, dt));
+        position = vAdd(position, vScale(velocity, dt));
+
+        // 8. Collisions
+        // Planet Surface
+        if (vMag(position) <= PLANET_RADIUS) {
+            const radialVel = vDot(velocity, vNorm(position));
+            
+            if (radialVel < -10) {
+                 events.push(`Crashed into Planet`);
+                 currentState.active = false;
+                 currentState.finished = true;
+            } else if (vMag(velocity) < 1) {
+                 // Only trigger landing if we have actually flown high enough
+                 if (maxAltitude > 50) {
+                     events.push("Landed on Planet");
+                     currentState.active = false;
+                     currentState.finished = true;
+                 } else {
+                     // Just resting on pad - clamp to surface
+                     position = vScale(vNorm(position), PLANET_RADIUS);
+                     velocity = { x: 0, y: 0 };
+                 }
+            } else {
+                 // Hard stop if slow enough but not landed state
+                 position = vScale(vNorm(position), PLANET_RADIUS);
+                 if (radialVel < 0) {
+                     // Kill radial velocity if moving down
+                     const tangent = { x: -position.y, y: position.x };
+                     const tMag = vMag(tangent);
+                     const tNorm = tMag > 0 ? vScale(tangent, 1/tMag) : {x:0, y:0};
+                     const tVel = vDot(velocity, tNorm);
+                     velocity = vScale(tNorm, tVel);
+                 }
+            }
+        }
+        
+        // Moon Surface
+        if (rm <= MOON_RADIUS) {
+            const radialVel = vDot(velocity, vNorm({x: dMx, y: dMy}));
+            if (radialVel < -10) {
+                events.push(`Crashed into Moon`);
+                currentState.active = false;
+                currentState.finished = true;
+            } else {
+                events.push("THE EAGLE HAS LANDED!");
+                currentState.active = false;
+                currentState.finished = true;
+                position = vAdd(moonPos, vScale(vNorm({x: dMx, y: dMy}), MOON_RADIUS));
+                velocity = { x: 0, y: 0 }; 
+            }
         }
     }
 
-    // Debris Physics
-    const newDebris = debris.map(d => {
-        const dDistSq = d.position.x*d.position.x + d.position.y*d.position.y;
-        const dDist = Math.sqrt(dDistSq);
-        const dGAX = -d.position.x / dDist * (GRAVITATIONAL_PARAM / dDistSq);
-        const dGAY = -d.position.y / dDist * (GRAVITATIONAL_PARAM / dDistSq);
-        
-        let dvx = d.velocity.x + dGAX * TIME_STEP;
-        let dvy = d.velocity.y + dGAY * TIME_STEP;
-        let dpx = d.position.x + dvx * TIME_STEP;
-        let dpy = d.position.y + dvy * TIME_STEP;
-        
-        if (dDist - PLANET_RADIUS < ATMOSPHERE_HEIGHT) {
-            dvx *= 0.99;
-            dvy *= 0.99;
-        }
-
-        return {
-            ...d,
-            position: { x: dpx, y: dpy },
-            velocity: { x: dvx, y: dvy },
-            rotation: d.rotation + d.angularVelocity * TIME_STEP
-        };
-    }).filter(d => {
-        const h = Math.sqrt(d.position.x**2 + d.position.y**2) - PLANET_RADIUS;
-        return h > 0; 
-    });
-
-    const nextState = {
-        ...currentState,
-        position, velocity, rotation, angularVelocity,
-        altitude,
-        throttle,
-        velocityMag: speed,
-        verticalVelocity: vVert,
-        horizontalVelocity: vHoriz,
-        acceleration: Math.sqrt(ax*ax + ay*ay),
-        semiMajorAxis,
-        eccentricity,
-        apoapsis,
-        periapsis,
-        time: time + TIME_STEP,
-        maxAltitude: Math.max(maxAltitude, altitude),
-        events, debris: newDebris, active, finished,
-        forces: {
-            thrust: { x: thrustX, y: thrustY },
-            drag: { x: dragFx, y: dragFy },
-            gravity: { x: gravAccelX * mass, y: gravAccelY * mass }
-        }
-    };
-    stateRef.current = nextState;
-    setSimState(nextState);
+    // Telemetry Update
+    const distCenter = vMag(position);
+    const altitude = distCenter - PLANET_RADIUS;
     
-    if (Math.floor(time * 20) % 10 === 0) {
-        setTelemetry(prev => [...prev.slice(-49), {
-            time: Number(time.toFixed(1)),
-            altitude: Number(altitude.toFixed(1)),
-            velocity: Number(speed.toFixed(1)),
-            verticalVelocity: Number(vVert.toFixed(1)),
-            horizontalVelocity: Number(vHoriz.toFixed(1))
-        }]);
-    }
-  }, []); 
+    stateRef.current = {
+        ...currentState,
+        position, velocity, rotation, angularVelocity, time, maxAltitude: Math.max(maxAltitude, altitude), events, parts,
+        altitude,
+        velocityMag: vMag(velocity),
+    };
+    
+    setSimState(stateRef.current);
+  };
 
+  // --- ANIMATION LOOP ---
   const animate = useCallback(() => {
     updatePhysics();
     drawFrame();
     requestRef.current = requestAnimationFrame(animate);
-  }, [updatePhysics]);
-
-  const drawVector = (ctx: CanvasRenderingContext2D, vx: number, vy: number, color: string, label: string) => {
-      const mag = Math.sqrt(vx*vx + vy*vy);
-      if (mag < 100) return; // Hide negligible forces
-      
-      const SCALE_FORCE = 0.0005; // 200kN = 100px
-      const dx = vx * SCALE_FORCE;
-      const dy = vy * SCALE_FORCE;
-      
-      // We are at Rocket Center.
-      
-      ctx.beginPath();
-      ctx.moveTo(0, 0);
-      ctx.lineTo(dx, dy);
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 3 / zoomRef.current; // Constant thickness
-      ctx.stroke();
-
-      // Arrowhead
-      const angle = Math.atan2(dy, dx);
-      const headLen = 15 / zoomRef.current;
-      ctx.beginPath();
-      ctx.moveTo(dx, dy);
-      ctx.lineTo(dx - headLen * Math.cos(angle - Math.PI / 6), dy - headLen * Math.sin(angle - Math.PI / 6));
-      ctx.lineTo(dx - headLen * Math.cos(angle + Math.PI / 6), dy - headLen * Math.sin(angle + Math.PI / 6));
-      ctx.fillStyle = color;
-      ctx.fill();
-  };
-
-  const drawOrbit = (ctx: CanvasRenderingContext2D, pos: Vector2, vel: Vector2) => {
-      // Calculate Orbital Elements on the fly for rendering
-      const x = pos.x;
-      const y = pos.y;
-      const vx = vel.x;
-      const vy = vel.y;
-      
-      const r = Math.sqrt(x*x + y*y);
-      const vSq = vx*vx + vy*vy;
-      const mu = GRAVITATIONAL_PARAM;
-      
-      // Angular momentum h = r x v (2D cross product)
-      const h = x*vy - y*vx;
-      
-      // Eccentricity Vector e = (1/mu) * [(v^2 - mu/r)r - (r.v)v]
-      const rDotV = x*vx + y*vy;
-      const term1 = vSq - mu/r;
-      const ex = (1/mu) * (term1*x - rDotV*vx);
-      const ey = (1/mu) * (term1*y - rDotV*vy);
-      
-      const ecc = Math.sqrt(ex*ex + ey*ey);
-      const argPeriapsis = Math.atan2(ey, ex); // angle of periapsis vector
-      
-      // Semi-latus rectum p = h^2 / mu
-      const p = (h*h) / mu;
-      
-      ctx.save();
-      // Orbit drawing is in World Space (Planet Center 0,0)
-      // Existing context is already set to World Space by drawFrame before calling this, if we insert it correctly.
-      
-      ctx.beginPath();
-      ctx.strokeStyle = '#38bdf8'; // Sky blue
-      ctx.lineWidth = 1 / zoomRef.current;
-      if (ctx.lineWidth < 1) ctx.lineWidth = 1;
-      ctx.setLineDash([10 / zoomRef.current, 10 / zoomRef.current]);
-
-      // Draw Orbit
-      const step = 0.05;
-      let started = false;
-      
-      // Range for theta:
-      // Ellipse: 0 to 2PI
-      // Hyperbola (e > 1): -acos(-1/e) to acos(-1/e) (asymptotes). 
-      // We clip slightly to avoid infinity.
-      
-      let startTheta = 0;
-      let endTheta = Math.PI * 2;
-      
-      if (ecc > 1.0) {
-          const asymptoteAngle = Math.acos(-1/ecc);
-          startTheta = -asymptoteAngle + 0.1;
-          endTheta = asymptoteAngle - 0.1;
-      }
-      
-      for (let theta = startTheta; theta <= endTheta; theta += step) {
-          const r_theta = p / (1 + ecc * Math.cos(theta));
-          
-          // Polar to Cartesian in Orbit Frame (Periapsis on X axis)
-          const ox = r_theta * Math.cos(theta);
-          const oy = r_theta * Math.sin(theta);
-          
-          // Rotate to World Frame
-          const wx = ox * Math.cos(argPeriapsis) - oy * Math.sin(argPeriapsis);
-          const wy = ox * Math.sin(argPeriapsis) + oy * Math.cos(argPeriapsis);
-          
-          if (!started) {
-              ctx.moveTo(wx * SCALE, wy * SCALE);
-              started = true;
-          } else {
-              ctx.lineTo(wx * SCALE, wy * SCALE);
-          }
-      }
-      if (ecc < 1.0) ctx.closePath();
-      ctx.stroke();
-      ctx.setLineDash([]);
-      
-      // Draw Markers (Ap/Pe)
-      const drawMarker = (label: string, theta: number) => {
-          const r_m = p / (1 + ecc * Math.cos(theta));
-          const ox = r_m * Math.cos(theta);
-          const oy = r_m * Math.sin(theta);
-          const wx = ox * Math.cos(argPeriapsis) - oy * Math.sin(argPeriapsis);
-          const wy = ox * Math.sin(argPeriapsis) + oy * Math.cos(argPeriapsis);
-          
-          // Don't draw Apoapsis if hyperbolic and negative distance (math artifact, though handled by theta limits usually)
-          if (r_m < 0) return;
-
-          const screenX = wx * SCALE;
-          const screenY = wy * SCALE;
-          
-          ctx.save();
-          ctx.translate(screenX, screenY);
-          // Scale marker to stay constant size on screen
-          const scale = 1/zoomRef.current;
-          ctx.scale(scale, scale);
-          
-          ctx.fillStyle = '#38bdf8';
-          ctx.beginPath();
-          ctx.arc(0, 0, 4, 0, Math.PI*2);
-          ctx.fill();
-          
-          ctx.fillStyle = 'white';
-          ctx.font = '12px monospace';
-          ctx.fillText(label, 8, 4);
-          ctx.restore();
-      };
-      
-      drawMarker("Pe", 0);
-      if (ecc < 1.0) drawMarker("Ap", Math.PI);
-
-      ctx.restore();
-  };
-
-  const drawFrame = () => {
-     if (!canvasRef.current || !containerRef.current) return;
-     const { clientWidth, clientHeight } = containerRef.current;
-     if (canvasRef.current.width !== clientWidth * (window.devicePixelRatio||1)) {
-         setupCanvas(canvasRef.current, clientWidth, clientHeight);
-     }
-     const ctx = canvasRef.current.getContext('2d');
-     if (!ctx) return;
-     
-     const dpr = window.devicePixelRatio || 1;
-     ctx.resetTransform();
-     ctx.scale(dpr, dpr);
-     ctx.clearRect(0,0, clientWidth, clientHeight);
-     
-     const { position, rotation, velocity, debris, parts, altitude, forces, throttle } = stateRef.current;
-     const currentZoom = zoomRef.current;
-
-     const cx = clientWidth / 2;
-     const cy = clientHeight / 2;
-
-     // Camera Transform
-     const planetAngle = Math.atan2(position.y, position.x);
-     const viewRotation = -Math.PI / 2 - planetAngle;
-
-     ctx.save();
-     
-     // 3a. Move to Center of Screen
-     ctx.translate(cx, cy);
-     
-     // 3b. Rotate World
-     ctx.rotate(viewRotation);
-     
-     // 3c. Scale
-     ctx.scale(currentZoom, currentZoom);
-     
-     // 3d. Translate World so Rocket is at (0,0) (before screen centering)
-     ctx.translate(-position.x * SCALE, -position.y * SCALE);
-     
-     // --- DRAW WORLD SPACE ---
-
-     // Draw Planet
-     ctx.beginPath();
-     ctx.arc(0, 0, PLANET_RADIUS * SCALE, 0, Math.PI * 2);
-     ctx.fillStyle = '#3b82f6'; // Ocean Blue
-     ctx.fill();
-     
-     // Atmosphere
-     const grad = ctx.createRadialGradient(0, 0, PLANET_RADIUS * SCALE, 0, 0, (PLANET_RADIUS + ATMOSPHERE_HEIGHT) * SCALE);
-     grad.addColorStop(0, 'rgba(147, 197, 253, 0.5)'); 
-     grad.addColorStop(1, 'rgba(147, 197, 253, 0)');
-     ctx.fillStyle = grad;
-     ctx.beginPath();
-     ctx.arc(0, 0, (PLANET_RADIUS + ATMOSPHERE_HEIGHT) * SCALE, 0, Math.PI*2);
-     ctx.fill();
-
-     // Draw Orbit
-     if (altitude > 1000 || (velocity.x*velocity.x + velocity.y*velocity.y) > 100) {
-         drawOrbit(ctx, position, velocity);
-     }
-
-     // Draw Debris
-     debris.forEach(d => {
-         ctx.save();
-         ctx.translate(d.position.x * SCALE, d.position.y * SCALE);
-         ctx.rotate(d.rotation);
-         const layout = calculateRocketLayout(d.parts);
-         layout.forEach(p => renderPart(ctx, p, 1));
-         ctx.restore();
-     });
-
-     // Draw Active Rocket
-     ctx.save();
-     ctx.translate(position.x * SCALE, position.y * SCALE);
-     ctx.rotate(rotation);
-     const rocketLayout = calculateRocketLayout(parts);
-     rocketLayout.forEach(p => renderPart(ctx, p, throttle));
-     ctx.restore();
-
-     // Draw Force Vectors (Overlaid on Rocket Center)
-     if (showForcesRef.current && forces) {
-         ctx.save();
-         ctx.translate(position.x * SCALE, position.y * SCALE);
-         // Don't rotate - forces are in World Space (aligned with XY axes)
-         
-         drawVector(ctx, forces.thrust.x, forces.thrust.y, '#fbbf24', 'Thrust'); // Yellow
-         drawVector(ctx, forces.drag.x, forces.drag.y, '#ef4444', 'Drag');       // Red
-         drawVector(ctx, forces.gravity.x, forces.gravity.y, '#a855f7', 'Grav'); // Purple
-         
-         ctx.restore();
-     }
-     
-     ctx.restore();
-  };
-
-  const renderPart = (ctx: CanvasRenderingContext2D, p: any, throttleLevel: number) => {
-      ctx.save();
-      ctx.translate(p.x, p.y);
-      ctx.rotate(p.rotation);
-      if (p.radialOffset === -1) ctx.scale(-1, 1);
-      
-      const w = p.width * SCALE;
-      const h = p.height * SCALE;
-      const style = getPartStyle(p.type);
-      
-      ctx.fillStyle = style.fill;
-      ctx.strokeStyle = style.stroke;
-      ctx.lineWidth = 2; 
-      
-      drawPartShape(ctx, p.type, w, h, p.isDeployed);
-      ctx.fill();
-      
-      if (p.type === PartType.TANK && p.currentFuel !== undefined && p.fuelCapacity) {
-          const ratio = p.currentFuel / p.fuelCapacity;
-          if (ratio > 0) {
-              ctx.fillStyle = 'rgba(6, 182, 212, 0.5)';
-              const fillH = h * ratio;
-              const hw = w/2;
-              const hh = h/2;
-              ctx.fillRect(-hw + 1, hh - fillH, w - 2, fillH);
-          }
-      }
-      ctx.stroke();
-
-      if (p.type === PartType.ENGINE && p.isThrusting && throttleLevel > 0) {
-           const hh = h/2;
-           ctx.beginPath();
-           ctx.moveTo(-w/4, hh);
-           ctx.lineTo(w/4, hh);
-           // Flame length depends on throttle
-           const flameLen = (20 + Math.random()*30) * throttleLevel;
-           ctx.lineTo(0, hh + flameLen);
-           ctx.fillStyle = `rgba(249, 115, 22, ${0.5 + throttleLevel * 0.5})`; // vary opacity too
-           ctx.fill();
-      }
-      ctx.restore();
-  };
+  }, []); // Empty dependencies ensures loop stability
 
   useEffect(() => {
     requestRef.current = requestAnimationFrame(animate);
     return () => cancelAnimationFrame(requestRef.current);
   }, [animate]);
 
+
   const handleStage = () => {
-    const currentParts = stateRef.current.parts;
-    const layout = calculateRocketLayout(currentParts);
-    const decouplers = currentParts.filter(p => p.type === PartType.DECOUPLER);
-    if (decouplers.length === 0) return;
-    
-    const sorted = decouplers
-        .map(d => ({ part: d, y: layout.find(l => l.instanceId === d.instanceId)?.y || 0 }))
-        .sort((a,b) => b.y - a.y);
-        
-    const target = sorted[0].part;
-    const partsToRemove = new Set<string>();
-    partsToRemove.add(target.instanceId);
-    
-    const stack = [target.instanceId];
-    while (stack.length > 0) {
-        const id = stack.pop()!;
-        const children = currentParts.filter(p => p.parentId === id);
-        children.forEach(c => {
-            partsToRemove.add(c.instanceId);
-            stack.push(c.instanceId);
-        });
-    }
-    
-    const remaining = currentParts.filter(p => !partsToRemove.has(p.instanceId));
-    const staged = currentParts.filter(p => partsToRemove.has(p.instanceId));
-    
-    const stagedRoot = staged.find(p => p.instanceId === target.instanceId);
-    if (stagedRoot) {
-        stagedRoot.parentId = undefined;
-        stagedRoot.parentNodeId = undefined;
-    }
-
-    setActiveParts(remaining);
-    
-    const { velocity, rotation, position, events, debris, angularVelocity } = stateRef.current;
-    
-    const kickSpeed = 2;
-    const kickX = -Math.sin(rotation) * kickSpeed;
-    const kickY = Math.cos(rotation) * kickSpeed; 
-    
-    const newDebris: Debris = {
-        id: Math.random().toString(),
-        parts: staged,
-        position: { ...position },
-        velocity: { x: velocity.x + kickX, y: velocity.y + kickY }, 
-        rotation: rotation,
-        angularVelocity: angularVelocity + (Math.random()-0.5)
-    };
-    
-    const nextEvents = [...events, `Staging`];
-    stateRef.current = { ...stateRef.current, parts: remaining, debris: [...debris, newDebris], events: nextEvents };
-    setSimState(stateRef.current);
+      const parts = stateRef.current.parts;
+      const layout = calculateRocketLayout(parts);
+      const decouplers = parts.filter(p => p.type === PartType.DECOUPLER);
+      if (decouplers.length === 0) return;
+      
+      const sorted = decouplers.map(d => {
+          const l = layout.find(lp => lp.instanceId === d.instanceId);
+          return { part: d, y: l ? l.y : 0 };
+      }).sort((a,b) => b.y - a.y);
+      const target = sorted[0].part;
+      
+      const toRemove = new Set<string>();
+      const stack = [target.instanceId];
+      toRemove.add(target.instanceId);
+      
+      while(stack.length > 0) {
+          const pid = stack.pop()!;
+          const children = parts.filter(p => p.parentId === pid);
+          children.forEach(c => {
+              toRemove.add(c.instanceId);
+              stack.push(c.instanceId);
+          });
+      }
+      
+      const remaining = parts.filter(p => !toRemove.has(p.instanceId));
+      setActiveParts(remaining);
+      stateRef.current.events.push(`Staged: ${target.name}`);
   };
 
-  const toggleSim = () => setSimState(s => ({ ...s, active: !s.active }));
-  const resetSim = () => {
-     const initialPos = { x: 0, y: -PLANET_RADIUS - 2 }; 
-     const initialRot = 0; 
-     
-     const resetParts = JSON.parse(JSON.stringify(initialParts));
-     setActiveParts(resetParts);
-     const resetState: SimulationState = { 
-         position: initialPos, 
-         velocity: {x:0, y:0}, 
-         rotation: initialRot, 
-         angularVelocity: 0, 
-         altitude: 0,
-         velocityMag: 0, 
-         verticalVelocity: 0,
-         horizontalVelocity: 0,
-         acceleration: 0, 
-         semiMajorAxis: 0,
-         eccentricity: 0,
-         apoapsis: 0,
-         periapsis: 0,
-         time: 0, 
-         parts: resetParts, 
-         debris: [], 
-         active: false, 
-         finished: false, 
-         maxAltitude: 0, 
-         events: [],
-         throttle: 1.0,
-         sasMode: SASMode.STABILITY,
-         forces: {
-            thrust: { x: 0, y: 0 },
-            gravity: { x: 0, y: 0 },
-            drag: { x: 0, y: 0 }
-         }
-     };
-     setSimState(resetState);
-     stateRef.current = resetState;
-     setTelemetry([]);
-  };
-
-  useEffect(() => {
-     resetSim();
-  }, []);
-
-  const setSAS = (mode: SASMode) => {
-      stateRef.current.sasMode = mode;
-      setSimState(prev => ({ ...prev, sasMode: mode }));
-  };
-
-  const hasParachutes = activeParts.some(p => p.type === PartType.PARACHUTE);
+  const state = simState;
+  const moonAngle = (state.time / MOON_ORBITAL_PERIOD) * 2 * Math.PI;
+  const moonPos = { x: Math.cos(moonAngle) * MOON_ORBIT_RADIUS, y: Math.sin(moonAngle) * MOON_ORBIT_RADIUS };
+  const distToMoon = Math.sqrt(Math.pow(state.position.x - moonPos.x, 2) + Math.pow(state.position.y - moonPos.y, 2));
+  const isInMoonSOI = distToMoon < MOON_SOI_RADIUS;
+  
+  const altitudeDisplay = isInMoonSOI ? (distToMoon - MOON_RADIUS) : state.altitude;
+  const nearestBodyAngle = isInMoonSOI ? Math.atan2(state.position.y - moonPos.y, state.position.x - moonPos.x) : Math.atan2(state.position.y, state.position.x);
 
   return (
-    <div className="flex h-screen bg-black text-white relative">
-      <div className="flex-1 relative overflow-hidden" ref={containerRef}>
-        <canvas ref={canvasRef} className="block w-full h-full"/>
-        
-        {/* HUD */}
-        <div className="absolute top-4 left-4 space-y-2 pointer-events-none select-none">
-           <div className="flex space-x-2">
-                <div className="bg-black/40 backdrop-blur p-3 rounded border border-white/10 w-40">
-                    <div className="text-xs text-slate-400 uppercase">Altitude</div>
-                    <div className="text-2xl font-mono text-cyan-400">{(simState.altitude/1000).toFixed(1)} km</div>
+    <div className="flex h-screen bg-slate-900 text-white relative overflow-hidden">
+        <canvas ref={canvasRef} width={window.innerWidth} height={window.innerHeight} className="absolute inset-0 block" />
+
+        {/* UI Overlay */}
+        <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-6">
+            <div className="flex justify-between items-start pointer-events-auto">
+                <div className="space-y-2">
+                    <div className="bg-slate-900/80 backdrop-blur border border-slate-700 p-4 rounded-xl shadow-xl w-64">
+                         <div className="flex justify-between items-end mb-2">
+                             <div className="text-xs uppercase text-slate-400 font-bold">{isInMoonSOI ? 'MOON ALT' : 'ALTITUDE'}</div>
+                             <div className="text-2xl font-mono text-cyan-400">{(altitudeDisplay/1000).toFixed(1)} <span className="text-sm text-slate-500">km</span></div>
+                         </div>
+                         <div className="flex justify-between items-end">
+                             <div className="text-xs uppercase text-slate-400 font-bold">SPEED</div>
+                             <div className="text-2xl font-mono text-cyan-400">{state.velocityMag.toFixed(0)} <span className="text-sm text-slate-500">m/s</span></div>
+                         </div>
+                    </div>
+                    <div className="bg-slate-900/80 backdrop-blur border border-slate-700 p-2 rounded-xl flex items-center space-x-4">
+                        <div className="text-xs text-slate-400 font-bold px-2">WARP</div>
+                        <div className="flex space-x-1">
+                            {[1, 5, 10, 50, 100].map(w => (
+                                <button onClick={() => setTimeWarp(w)} key={w} className={`w-8 h-6 flex items-center justify-center text-xs font-bold rounded ${timeWarp >= w ? 'bg-green-500 text-black' : 'bg-slate-700 text-slate-500'}`}>{w}x</button>
+                            ))}
+                        </div>
+                    </div>
                 </div>
-                <div className="bg-black/40 backdrop-blur p-3 rounded border border-white/10 w-40">
-                    <div className="text-xs text-slate-400 uppercase">Velocity</div>
-                    <div className="text-2xl font-mono text-cyan-400">{simState.velocityMag.toFixed(0)} m/s</div>
+
+                <div className="bg-slate-900/80 backdrop-blur border border-slate-700 p-4 rounded-xl shadow-xl w-64 max-h-48 overflow-y-auto">
+                    <div className="text-xs uppercase text-slate-400 font-bold mb-2 border-b border-white/10 pb-1">Mission Log</div>
+                    {state.events.slice().reverse().map((e, i) => (
+                        <div key={i} className="text-xs text-slate-300 py-0.5 border-l-2 border-orange-500 pl-2 mb-1">{e}</div>
+                    ))}
                 </div>
-           </div>
-           
-           <div className="flex space-x-2">
-               <div className="bg-black/40 backdrop-blur p-3 rounded border border-white/10 w-40">
-                   <div className="text-xs text-slate-400 uppercase">Vert. Speed</div>
-                   <div className="text-xl font-mono text-white">{simState.verticalVelocity.toFixed(0)} m/s</div>
-               </div>
-               <div className="bg-black/40 backdrop-blur p-3 rounded border border-white/10 w-40">
-                   <div className="text-xs text-slate-400 uppercase">Horiz. Speed</div>
-                   <div className="text-xl font-mono text-white">{simState.horizontalVelocity.toFixed(0)} m/s</div>
-               </div>
-           </div>
+            </div>
 
-           <div className="flex space-x-2">
-               <div className="bg-black/40 backdrop-blur p-3 rounded border border-white/10 w-40">
-                   <div className="text-xs text-slate-400 uppercase">Apoapsis</div>
-                   <div className="text-xl font-mono text-purple-400">{(simState.apoapsis > 1e10 ? '∞' : (simState.apoapsis/1000).toFixed(1))} km</div>
-               </div>
-               <div className="bg-black/40 backdrop-blur p-3 rounded border border-white/10 w-40">
-                   <div className="text-xs text-slate-400 uppercase">Periapsis</div>
-                   <div className="text-xl font-mono text-purple-400">{(simState.periapsis/1000).toFixed(1)} km</div>
-               </div>
-           </div>
-           
-           <div className="bg-black/40 backdrop-blur p-3 rounded border border-white/10 w-40">
-               <div className="text-xs text-slate-400 uppercase">Eccentricity</div>
-               <div className="text-xl font-mono text-white">{simState.eccentricity.toFixed(3)}</div>
-           </div>
+            <div className="flex items-end justify-between pointer-events-auto">
+                <div className="flex items-end space-x-4">
+                    <NavBall rotation={state.rotation} velocity={state.velocity} sasMode={sasMode} nearestBodyAngle={nearestBodyAngle} />
+                    <div className="h-32 w-8 bg-slate-800 rounded-full border border-slate-600 relative overflow-hidden">
+                        <div className="absolute bottom-0 left-0 right-0 bg-orange-500 transition-all duration-100 ease-linear" style={{ height: `${throttle * 100}%` }}></div>
+                        <div className="absolute inset-0 flex flex-col justify-between py-2 items-center text-[10px] font-bold text-white/50 mix-blend-difference"><span>100</span><span>50</span><span>0</span></div>
+                    </div>
+                </div>
 
-           <div className="flex space-x-2">
-             <div className="bg-black/40 backdrop-blur p-3 rounded border border-white/10 w-40">
-                 <div className="text-xs text-slate-400 uppercase">Mission Time</div>
-                 <div className="text-xl font-mono text-white">T+{simState.time.toFixed(1)}s</div>
-             </div>
-             
-             {/* Throttle Gauge */}
-             <div className="bg-black/40 backdrop-blur p-3 rounded border border-white/10 w-40 relative overflow-hidden">
-                 <div className="text-xs text-slate-400 uppercase relative z-10">Throttle</div>
-                 <div className="text-xl font-mono text-white relative z-10">{(simState.throttle * 100).toFixed(0)}%</div>
-                 <div 
-                    className="absolute bottom-0 left-0 h-1.5 bg-orange-500 transition-all duration-75"
-                    style={{ width: `${simState.throttle * 100}%` }}
-                 />
-             </div>
-           </div>
-        </div>
+                <div className="flex flex-col space-y-2 bg-slate-900/80 backdrop-blur p-2 rounded-xl border border-slate-700">
+                     <div className="text-xs font-bold text-slate-400 text-center">SAS CONTROL</div>
+                     <div className="flex space-x-2">
+                         <button onClick={() => setSasMode(SASMode.STABILITY)} className={`p-2 rounded ${sasMode === SASMode.STABILITY ? 'bg-cyan-600' : 'bg-slate-700'}`} title="Stability"><CircleOff size={18}/></button>
+                         <button onClick={() => setSasMode(SASMode.PROGRADE)} className={`p-2 rounded ${sasMode === SASMode.PROGRADE ? 'bg-green-600' : 'bg-slate-700'}`} title="Prograde"><ArrowUpCircle size={18}/></button>
+                         <button onClick={() => setSasMode(SASMode.RETROGRADE)} className={`p-2 rounded ${sasMode === SASMode.RETROGRADE ? 'bg-orange-600' : 'bg-slate-700'}`} title="Retrograde"><ArrowDownCircle size={18}/></button>
+                     </div>
+                </div>
 
-        {/* SAS Controls */}
-        <div className="absolute top-4 left-[360px] pointer-events-auto flex flex-col space-y-2">
-            <div className="bg-black/40 backdrop-blur p-2 rounded border border-white/10">
-                <div className="text-[10px] text-slate-400 uppercase mb-1 font-bold">SAS Control</div>
+                <div className="flex items-center space-x-4 bg-slate-900/80 backdrop-blur p-3 rounded-full border border-slate-700">
+                    <button onClick={() => setSimState(s => ({...s, active: !s.active}))} className="p-3 bg-green-600 hover:bg-green-500 rounded-full text-white shadow-lg shadow-green-900/40">
+                        {simState.active ? <Pause fill="currentColor"/> : <Play fill="currentColor" className="ml-1"/>}
+                    </button>
+                    <button onClick={handleStage} className="px-6 py-3 bg-yellow-600 hover:bg-yellow-500 rounded-full font-bold text-white shadow-lg shadow-yellow-900/40 flex items-center">
+                        <Layers className="mr-2" size={18}/> STAGE
+                    </button>
+                </div>
+
                 <div className="flex flex-col space-y-2">
-                    <button 
-                        onClick={() => setSAS(SASMode.STABILITY)}
-                        className={`flex items-center space-x-2 px-3 py-1.5 rounded text-sm font-bold transition-colors ${simState.sasMode === SASMode.STABILITY ? 'bg-cyan-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'}`}
-                    >
-                        <CircleOff size={16} /> <span>Stability</span>
-                    </button>
-                    <button 
-                        onClick={() => setSAS(SASMode.PROGRADE)}
-                        className={`flex items-center space-x-2 px-3 py-1.5 rounded text-sm font-bold transition-colors ${simState.sasMode === SASMode.PROGRADE ? 'bg-green-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'}`}
-                    >
-                        <ArrowUpCircle size={16} /> <span>Prograde</span>
-                    </button>
-                    <button 
-                        onClick={() => setSAS(SASMode.RETROGRADE)}
-                        className={`flex items-center space-x-2 px-3 py-1.5 rounded text-sm font-bold transition-colors ${simState.sasMode === SASMode.RETROGRADE ? 'bg-orange-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'}`}
-                    >
-                        <ArrowDownCircle size={16} /> <span>Retrograde</span>
-                    </button>
-                    <button 
-                        onClick={() => setSAS(SASMode.MANUAL)}
-                        className={`flex items-center space-x-2 px-3 py-1.5 rounded text-sm font-bold transition-colors ${simState.sasMode === SASMode.MANUAL ? 'bg-red-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'}`}
-                    >
-                        <Power size={16} /> <span>SAS OFF</span>
+                    <div className="bg-slate-900/80 backdrop-blur p-2 rounded-xl border border-slate-700 flex space-x-2">
+                        <button onClick={() => setFocusBody('ROCKET')} className={`p-2 rounded ${focusBody === 'ROCKET' ? 'bg-blue-600' : 'bg-slate-700'}`} title="Focus Ship"><RocketPartIcon/></button>
+                        <button onClick={() => setFocusBody('MOON')} className={`p-2 rounded ${focusBody === 'MOON' ? 'bg-slate-500' : 'bg-slate-700'}`} title="Focus Moon"><div className="w-4 h-4 rounded-full bg-gray-300"></div></button>
+                        <button onClick={() => setFocusBody('PLANET')} className={`p-2 rounded ${focusBody === 'PLANET' ? 'bg-blue-400' : 'bg-slate-700'}`} title="Focus Planet"><div className="w-4 h-4 rounded-full bg-blue-500"></div></button>
+                    </div>
+                    <button onClick={onExit} className="p-3 bg-red-600 hover:bg-red-500 rounded-full text-white shadow-lg shadow-red-900/40 self-end">
+                        <Square fill="currentColor" size={18}/>
                     </button>
                 </div>
             </div>
-            
-            {hasParachutes && (
-                <button 
-                    onClick={deployParachutes}
-                    className="flex items-center justify-center space-x-2 px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded font-bold shadow-lg transition-transform active:scale-95"
-                >
-                    <Umbrella size={18}/> <span>DEPLOY CHUTES</span>
-                </button>
-            )}
+             <div className="absolute bottom-24 left-1/2 -translate-x-1/2 text-white/30 text-[10px] font-mono pointer-events-none text-center">
+                SHIFT/CTRL: Throttle • Z/X: Max/Cut • T: SAS Toggle • &lt;/&gt;: Warp
+            </div>
         </div>
-        
-        {/* NavBall */}
-        <div className="absolute bottom-24 left-1/2 transform -translate-x-1/2 pointer-events-none z-20">
-             <NavBall 
-                 rotation={simState.rotation}
-                 position={simState.position}
-                 velocity={simState.velocity}
-                 sasMode={simState.sasMode}
-             />
-        </div>
-
-        {/* Controls */}
-        <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 flex items-center space-x-4">
-            <button onClick={toggleSim} className="p-4 bg-green-600 hover:bg-green-500 rounded-full shadow-lg shadow-green-900/50 transition-transform active:scale-95">
-                {simState.active ? <Pause fill="white" /> : <Play fill="white" className="ml-1" />}
-            </button>
-            <button onClick={handleStage} className="px-6 py-3 bg-yellow-600 hover:bg-yellow-500 rounded-full font-bold shadow-lg shadow-yellow-900/50 flex items-center transition-transform active:scale-95">
-                <Layers className="mr-2" size={18}/> STAGE
-            </button>
-            <button onClick={() => setShowForces(prev => !prev)} className={`p-4 rounded-full shadow-lg transition-transform active:scale-95 ${showForces ? 'bg-indigo-600 shadow-indigo-900/50' : 'bg-slate-700 hover:bg-slate-600'}`}>
-                <Move fill="white" size={18}/>
-            </button>
-            <button onClick={onExit} className="p-4 bg-red-600 hover:bg-red-500 rounded-full shadow-lg shadow-red-900/50 transition-transform active:scale-95">
-                <Square fill="white" size={18}/>
-            </button>
-        </div>
-        
-        {/* Controls Help */}
-        <div className="absolute top-4 right-80 text-white/50 text-xs pointer-events-none text-right">
-            <div>Arrow Left/Right to Turn</div>
-            <div>Shift/Ctrl to Throttle</div>
-            <div>Z/X for Max/Cut Throttle</div>
-            <div>P to Deploy Chutes</div>
-            <div>Scroll to Zoom</div>
-        </div>
-      </div>
-      
-      {/* Sidebar */}
-      <div className="w-80 bg-slate-900 border-l border-slate-800 flex flex-col z-10">
-          <div className="p-4 border-b border-slate-800 flex justify-between items-center">
-              <h3 className="font-bold text-slate-200">Orbital Data</h3>
-              <button onClick={onExit}><X size={20} className="text-slate-400 hover:text-white"/></button>
-          </div>
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              <div className="bg-black/50 p-2 rounded border border-slate-800 h-32">
-                  <div className="text-[10px] text-slate-500 mb-1">ALTITUDE</div>
-                  <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={telemetry}>
-                          <YAxis hide domain={['auto', 'auto']}/>
-                          <Tooltip contentStyle={{backgroundColor: '#1e293b', border: 'none', fontSize: '12px'}} itemStyle={{color: '#06b6d4'}} formatter={(value: number) => [value.toFixed(0) + 'm', 'Alt']}/>
-                          <Area type="monotone" dataKey="altitude" stroke="#06b6d4" fill="#06b6d4" fillOpacity={0.1} isAnimationActive={false} strokeWidth={2}/>
-                      </AreaChart>
-                  </ResponsiveContainer>
-              </div>
-              <div className="bg-black/50 p-2 rounded border border-slate-800 h-32">
-                   <div className="text-[10px] text-slate-500 mb-1">VELOCITY</div>
-                  <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={telemetry}>
-                          <YAxis hide domain={['auto', 'auto']}/>
-                          <Tooltip contentStyle={{backgroundColor: '#1e293b', border: 'none', fontSize: '12px'}} itemStyle={{color: '#8b5cf6'}} formatter={(value: number) => [value.toFixed(0) + 'm/s', 'Vel']}/>
-                          <Area type="monotone" dataKey="velocity" stroke="#8b5cf6" fill="#8b5cf6" fillOpacity={0.1} isAnimationActive={false} strokeWidth={2}/>
-                      </AreaChart>
-                  </ResponsiveContainer>
-              </div>
-               <div className="bg-black/50 p-2 rounded border border-slate-800 h-32">
-                   <div className="text-[10px] text-slate-500 mb-1">VERTICAL SPEED</div>
-                  <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={telemetry}>
-                          <YAxis hide domain={['auto', 'auto']}/>
-                          <Tooltip contentStyle={{backgroundColor: '#1e293b', border: 'none', fontSize: '12px'}} itemStyle={{color: '#10b981'}} formatter={(value: number) => [value.toFixed(0) + 'm/s', 'V.Spd']}/>
-                          <Area type="monotone" dataKey="verticalVelocity" stroke="#10b981" fill="#10b981" fillOpacity={0.1} isAnimationActive={false} strokeWidth={2}/>
-                      </AreaChart>
-                  </ResponsiveContainer>
-              </div>
-              <div className="bg-black/50 p-2 rounded border border-slate-800 h-32">
-                   <div className="text-[10px] text-slate-500 mb-1">HORIZONTAL SPEED</div>
-                  <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={telemetry}>
-                          <YAxis hide domain={['auto', 'auto']}/>
-                          <Tooltip contentStyle={{backgroundColor: '#1e293b', border: 'none', fontSize: '12px'}} itemStyle={{color: '#f59e0b'}} formatter={(value: number) => [value.toFixed(0) + 'm/s', 'H.Spd']}/>
-                          <Area type="monotone" dataKey="horizontalVelocity" stroke="#f59e0b" fill="#f59e0b" fillOpacity={0.1} isAnimationActive={false} strokeWidth={2}/>
-                      </AreaChart>
-                  </ResponsiveContainer>
-              </div>
-
-              <div className="bg-black/50 border border-slate-800 rounded h-64 flex flex-col">
-                  <div className="p-2 border-b border-slate-800 bg-slate-800/30 text-xs font-bold text-slate-400">Mission Log</div>
-                  <div className="flex-1 overflow-y-auto p-2 space-y-1 font-mono text-xs">
-                      {simState.events.map((e, i) => (
-                          <div key={i} className="text-slate-300 border-l-2 border-cyan-500 pl-2 py-0.5">{e}</div>
-                      ))}
-                  </div>
-              </div>
-              <button onClick={resetSim} className="w-full py-2 border border-slate-700 rounded text-slate-300 hover:bg-slate-800 flex items-center justify-center text-sm">
-                  <RotateCcw size={14} className="mr-2"/> Reset Launch
-              </button>
-          </div>
-      </div>
     </div>
   );
 };
+
+const RocketPartIcon = () => (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/>
+        <path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/>
+        <path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/>
+        <path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>
+    </svg>
+);
